@@ -23,7 +23,7 @@ const K: f32 = 62.0;
 // ---- 气泡漂浮的参数 ----
 /// 游走加速度。配合下面的阻尼，终速大约是 ACCEL * dt / (1 - DAMPING)
 const WANDER_ACCEL: f32 = 42.0;
-/// 每帧速度衰减，越小越黏、越不容易飘远
+/// 速度衰减，按 60fps 每帧计；实际会按 dt 换算，换帧率不影响手感
 const DAMPING: f32 = 0.92;
 /// 限速，世界单位/秒。K 是 62，所以横穿一条边要七八秒
 const MAX_SPEED: f32 = 8.0;
@@ -31,10 +31,31 @@ const MAX_SPEED: f32 = 8.0;
 const EDGE_SPRING: f32 = 3.0;
 /// 出了槽位之后被推回来的劲度
 const WALL_SPRING: f32 = 6.0;
+/// 斥力倍率。碰撞已经保证不重叠了，斥力只用来把团摊开，所以压得比较低
+const REPULSION: f32 = 0.35;
 /// 碰撞恢复系数，1 是完全弹性
 const RESTITUTION: f32 = 0.55;
 /// 气泡之间留一点缝，看起来不至于糊在一起
 const COLLIDE_PAD: f32 = 3.0;
+
+/// 一个节点在世界坐标里实际占的地方 —— 圆 **加上** 它底下那行单词。
+/// 碰撞按这个包围盒算，所以两个单词的字母永远不会叠在一起。
+#[derive(Clone, Copy)]
+pub struct Extent {
+    /// 包围盒的半宽半高
+    pub half: Vec2,
+    /// 包围盒中心相对节点锚点的 y 偏移
+    pub off_y: f32,
+}
+
+impl Extent {
+    fn fallback(radius: f32) -> Extent {
+        Extent {
+            half: Vec2::splat(radius),
+            off_y: 0.0,
+        }
+    }
+}
 
 struct Component {
     members: Vec<u32>,
@@ -67,13 +88,18 @@ pub struct Sim {
     wander_rate: Vec<f32>,
     /// 漂浮速度倍率，0 表示完全静止
     pub drift: f32,
-    /// 节点显示半径的倍率，碰撞用它算接触距离
-    pub node_scale: f32,
+    /// 每个节点连标签在内占的地方
+    extents: Vec<Extent>,
 }
 
 impl Sim {
-    pub fn new(ids: Vec<u32>, edges: Vec<(u32, u32)>) -> Sim {
+    pub fn new(ids: Vec<u32>, edges: Vec<(u32, u32)>, extents: Vec<Extent>) -> Sim {
         let n = ids.len();
+        let extents = if extents.len() == n {
+            extents
+        } else {
+            vec![Extent::fallback(9.0); n]
+        };
         let local: HashMap<u32, usize> = ids.iter().enumerate().map(|(i, &g)| (g, i)).collect();
 
         let mut degree = vec![0u32; n];
@@ -85,7 +111,7 @@ impl Sim {
             adj[b as usize].push(a);
         }
 
-        let (comp_of, mut comps) = split_components(n, &adj);
+        let (comp_of, mut comps) = split_components(n, &adj, &extents);
         pack(&mut comps);
 
         // 每个分量在自己槽位里用黄金角螺旋撒点，比随机均匀，收敛也快
@@ -117,12 +143,17 @@ impl Sim {
                 .map(|i| 0.12 + hash01(i as u32 ^ 0x5BF0_3635) * 0.30)
                 .collect(),
             drift: 1.0,
-            node_scale: 1.0,
+            extents,
         }
     }
 
     pub fn len(&self) -> usize {
         self.ids.len()
+    }
+
+    /// 某个节点连标签在内占的地方，命中测试和绘制都要用。
+    pub fn extent(&self, i: usize) -> Extent {
+        self.extents[i]
     }
 
     pub fn component_count(&self) -> usize {
@@ -148,7 +179,8 @@ impl Sim {
         }
 
         // --- 斥力：只在分量内部算，分量之间靠装箱隔开 ---
-        let k2 = K * K;
+        // 现在「不许重叠」交给碰撞去保证了，斥力只负责把团摊开，可以弱一些
+        let k2 = K * K * REPULSION;
         for c in &self.comps {
             if c.members.len() < 2 {
                 continue;
@@ -159,13 +191,13 @@ impl Sim {
             }
         }
 
-        // --- 边的引力 ---
+        // --- 边的引力：拉到理想长度，让相连的词贴在一起 ---
         for &(a, b) in &self.edges {
             let (a, b) = (a as usize, b as usize);
             let delta = self.pos[b] - self.pos[a];
             let dist = delta.length().max(0.01);
-            let force = dist * dist / K;
             let dir = delta / dist;
+            let force = (dist - self.rest_len(a, b)) * 0.22;
             self.disp[a] += dir * force;
             self.disp[b] -= dir * force;
         }
@@ -186,6 +218,9 @@ impl Sim {
             }
         }
 
+        // 布局阶段也分开一次，这样即使关掉漂浮，标签也不会叠着
+        self.resolve_collisions();
+
         // --- 限幅位移并降温 ---
         let temp = self.alpha * K * 0.7;
         for i in 0..n {
@@ -202,11 +237,6 @@ impl Sim {
         if self.alpha < 0.005 {
             self.alpha = 0.0;
         }
-    }
-
-    /// 节点的碰撞半径，和画出来的圆保持一致。
-    fn node_radius(&self, i: usize) -> f32 {
-        (7.0 + 3.0 * (self.degree[i] as f32).sqrt()) * self.node_scale
     }
 
     /// 布局收敛之后的气泡漂浮。
@@ -233,7 +263,7 @@ impl Sim {
             let delta = self.pos[b] - self.pos[a];
             let dist = delta.length().max(0.01);
             let dir = delta / dist;
-            let f = (dist - K) * EDGE_SPRING * dt;
+            let f = (dist - self.rest_len(a, b)) * EDGE_SPRING * dt;
             self.vel[a] += dir * f;
             self.vel[b] -= dir * f;
         }
@@ -255,12 +285,15 @@ impl Sim {
         self.resolve_collisions();
 
         // --- 积分：阻尼 + 限速，保证是慢悠悠地飘 ---
+        // 阻尼本身是「每帧」的量，按 dt 折算成等效衰减，
+        // 这样 30fps 和 60fps 下气泡的速度和手感一致
+        let damping = DAMPING.powf(dt * 60.0);
         for i in 0..n {
             if Some(i) == self.pinned {
                 self.vel[i] = Vec2::ZERO;
                 continue;
             }
-            self.vel[i] *= DAMPING;
+            self.vel[i] *= damping;
             let speed = self.vel[i].length();
             let cap = MAX_SPEED * self.drift;
             if speed > cap {
@@ -270,46 +303,71 @@ impl Sim {
         }
     }
 
-    /// 气泡碰撞：圆压到一起就分开，并沿法线交换速度。
+    /// 一条边的理想长度。固定值不行 —— 胶囊本身就有一两百个单位宽，
+    /// 比固定边长还长，连着的两个词反而被挤得老远，图就没有「关系感」了。
+    /// 所以理想长度按两端胶囊的宽度来定，让它们刚好挨着。
+    fn rest_len(&self, a: usize, b: usize) -> f32 {
+        (self.extents[a].half.x + self.extents[b].half.x) * 0.95 + K * 0.30
+    }
+
+    /// 包围盒中心（节点圆心往下偏一点，因为标签在圆的下面）。
+    fn box_center(&self, i: usize) -> Vec2 {
+        self.pos[i].to_vec2() + Vec2::new(0.0, self.extents[i].off_y)
+    }
+
+    /// 气泡碰撞。
+    ///
+    /// 碰的是「圆 + 底下那行单词」的包围盒，不是光秃秃的圆 —— 所以两个单词的
+    /// 字母一旦要压到一起，节点就会先被弹开，永远轮不到「谁的标签让位」。
     /// 用均匀网格做邻域查询，不然节点一多就退化成两两比较。
     fn resolve_collisions(&mut self) {
         let n = self.pos.len();
         if n < 2 {
             return;
         }
-        let radii: Vec<f32> = (0..n).map(|i| self.node_radius(i)).collect();
-        let max_r = radii.iter().copied().fold(0.0f32, f32::max);
-        let cell = (2.0 * max_r + COLLIDE_PAD).max(1.0);
+        let max_half = self
+            .extents
+            .iter()
+            .map(|e| e.half.x.max(e.half.y))
+            .fold(0.0f32, f32::max);
+        let cell = (2.0 * max_half + COLLIDE_PAD).max(1.0);
 
-        let key = |p: Pos2| ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32);
+        let key = |p: Vec2| ((p.x / cell).floor() as i32, (p.y / cell).floor() as i32);
         let mut grid: HashMap<(i32, i32), Vec<u32>> = HashMap::with_capacity(n);
         for i in 0..n {
-            grid.entry(key(self.pos[i])).or_default().push(i as u32);
+            grid.entry(key(self.box_center(i))).or_default().push(i as u32);
         }
 
         for i in 0..n {
-            let (cx, cy) = key(self.pos[i]);
+            let (cx, cy) = key(self.box_center(i));
             for gx in cx - 1..=cx + 1 {
                 for gy in cy - 1..=cy + 1 {
                     let Some(bucket) = grid.get(&(gx, gy)) else {
                         continue;
                     };
-                    for &jj in bucket {
+                    for jj in bucket.clone() {
                         let j = jj as usize;
                         if j <= i {
                             continue;
                         }
-                        let delta = self.pos[j] - self.pos[i];
-                        let dist = delta.length();
-                        let min_d = radii[i] + radii[j] + COLLIDE_PAD;
-                        if dist >= min_d || dist < 1e-4 {
-                            continue;
+                        let delta = self.box_center(j) - self.box_center(i);
+                        let need_x = self.extents[i].half.x + self.extents[j].half.x + COLLIDE_PAD;
+                        let need_y = self.extents[i].half.y + self.extents[j].half.y + COLLIDE_PAD;
+                        let over_x = need_x - delta.x.abs();
+                        let over_y = need_y - delta.y.abs();
+                        if over_x <= 0.0 || over_y <= 0.0 {
+                            continue; // 盒子没相交
                         }
-                        let dir = delta / dist;
-                        let overlap = min_d - dist;
+
+                        // 沿「插得最浅」的那根轴分开，位移最小、看着最自然
+                        let (normal, depth) = if over_x < over_y {
+                            (Vec2::new(if delta.x < 0.0 { -1.0 } else { 1.0 }, 0.0), over_x)
+                        } else {
+                            (Vec2::new(0.0, if delta.y < 0.0 { -1.0 } else { 1.0 }), over_y)
+                        };
 
                         // 先把重叠推开，避免一直穿透着抖
-                        let push = dir * (overlap * 0.5);
+                        let push = normal * (depth * 0.5);
                         if Some(i) != self.pinned {
                             self.pos[i] -= push;
                         }
@@ -318,9 +376,9 @@ impl Sim {
                         }
 
                         // 只在互相靠近时反弹，分开中的不要再踹一脚
-                        let approach = (self.vel[j] - self.vel[i]).dot(dir);
+                        let approach = (self.vel[j] - self.vel[i]).dot(normal);
                         if approach < 0.0 {
-                            let imp = dir * (-(1.0 + RESTITUTION) * approach * 0.5);
+                            let imp = normal * (-(1.0 + RESTITUTION) * approach * 0.5);
                             self.vel[i] -= imp;
                             self.vel[j] += imp;
                         }
@@ -330,17 +388,25 @@ impl Sim {
         }
     }
 
+    /// 整张图的包围盒。要把胶囊的宽高算进去，否则边上那些长单词会被切掉一半。
     pub fn bounds(&self) -> egui::Rect {
         let mut rect = egui::Rect::NOTHING;
-        for p in &self.pos {
-            rect.extend_with(*p);
+        for (i, p) in self.pos.iter().enumerate() {
+            let e = &self.extents[i];
+            let c = *p + Vec2::new(0.0, e.off_y);
+            rect.extend_with(c - e.half);
+            rect.extend_with(c + e.half);
         }
         rect
     }
 }
 
 /// BFS 切连通分量，按大小降序排列（大团先装箱，排出来更整齐）。
-fn split_components(n: usize, adj: &[Vec<u32>]) -> (Vec<u32>, Vec<Component>) {
+fn split_components(
+    n: usize,
+    adj: &[Vec<u32>],
+    extents: &[Extent],
+) -> (Vec<u32>, Vec<Component>) {
     let mut comp_of = vec![u32::MAX; n];
     let mut groups: Vec<Vec<u32>> = Vec::new();
     let mut stack: Vec<u32> = Vec::new();
@@ -371,7 +437,7 @@ fn split_components(n: usize, adj: &[Vec<u32>]) -> (Vec<u32>, Vec<Component>) {
         for &m in &members {
             comp_of[m as usize] = id as u32;
         }
-        let radius = slot_radius(members.len());
+        let radius = slot_radius_for(&members, extents);
         comps.push(Component {
             members,
             anchor: Vec2::ZERO,
@@ -390,13 +456,26 @@ fn hash01(x: u32) -> f32 {
     (h >> 8) as f32 / (1u32 << 24) as f32
 }
 
-/// 一个 n 节点的团摊开后大概占多大。
-fn slot_radius(n: usize) -> f32 {
-    if n <= 1 {
-        K * 0.30
-    } else {
-        K * (0.55 * (n as f32).sqrt() + 0.35)
-    }
+/// 一个团摊开后大概占多大。
+///
+/// 之前只按节点个数估，现在标签也参与碰撞了，长单词占的地方大得多，
+/// 所以改成按成员包围盒的总面积折算，否则槽位装不下、节点会一直顶着软墙。
+fn slot_radius_for(members: &[u32], extents: &[Extent]) -> f32 {
+    let area: f32 = members
+        .iter()
+        .map(|&m| {
+            let e = &extents[m as usize];
+            4.0 * e.half.x * e.half.y
+        })
+        .sum();
+    // 装箱填充率大概七成，再留一圈余量
+    let by_area = (area / std::f32::consts::PI).sqrt() * 1.25 + K * 0.20;
+    // 至少要装得下最大的那一个
+    let biggest = members
+        .iter()
+        .map(|&m| extents[m as usize].half.length())
+        .fold(0.0f32, f32::max);
+    by_area.max(biggest * 1.08)
 }
 
 /// 同心环装箱：最大的团占住圆心，其余的按半径从大到小一圈圈往外排，
@@ -572,13 +651,30 @@ impl QuadTree {
 mod tests {
     use super::*;
 
+    /// 造一组假的 extent：每个节点一个 18x9 的盒子，够测装箱了。
+    fn fake_extents(n: usize) -> Vec<Extent> {
+        vec![
+            Extent {
+                half: Vec2::new(18.0, 9.0),
+                off_y: 4.0,
+            };
+            n
+        ]
+    }
+
     fn check_no_overlap(sizes: &[usize]) {
+        let total: usize = sizes.iter().sum();
+        let ext = fake_extents(total);
         let mut comps: Vec<Component> = sizes
             .iter()
-            .map(|&n| Component {
-                members: (0..n as u32).collect(),
-                anchor: Vec2::ZERO,
-                radius: slot_radius(n),
+            .map(|&n| {
+                let members: Vec<u32> = (0..n as u32).collect();
+                let radius = slot_radius_for(&members, &ext);
+                Component {
+                    members,
+                    anchor: Vec2::ZERO,
+                    radius,
+                }
             })
             .collect();
         pack(&mut comps);
@@ -613,9 +709,9 @@ mod tests {
     /// 两个气泡压在一起时应该被弹开。
     #[test]
     fn overlapping_bubbles_push_apart() {
-        let mut sim = Sim::new(vec![0, 1], Vec::new());
+        let mut sim = Sim::new(vec![0, 1], Vec::new(), fake_extents(2));
         sim.pos[0] = Pos2::new(0.0, 0.0);
-        sim.pos[1] = Pos2::new(4.0, 0.0);
+        sim.pos[1] = Pos2::new(6.0, 0.0);
         let before = (sim.pos[1] - sim.pos[0]).length();
         sim.drift_step(1.0 / 60.0);
         let after = (sim.pos[1] - sim.pos[0]).length();
@@ -626,7 +722,7 @@ mod tests {
     #[test]
     fn drifting_stays_inside_its_slot() {
         let ids: Vec<u32> = (0..30).collect();
-        let mut sim = Sim::new(ids, Vec::new());
+        let mut sim = Sim::new(ids, Vec::new(), fake_extents(30));
         while !sim.is_settled() {
             sim.step();
         }
@@ -640,11 +736,44 @@ mod tests {
         }
     }
 
+    /// 标签的包围盒不许叠在一起 —— 叠了就说明会出现「字母压字母」。
+    #[test]
+    fn label_boxes_never_overlap_after_settling() {
+        // 一个 12 个词的团，标签比圆大得多，最容易挤在一起
+        let ids: Vec<u32> = (0..12).collect();
+        let edges: Vec<(u32, u32)> = (1..12).map(|i| (0, i)).collect();
+        let ext = vec![
+            Extent {
+                half: Vec2::new(46.0, 12.0),
+                off_y: 6.0,
+            };
+            12
+        ];
+        let mut sim = Sim::new(ids, edges, ext);
+        while !sim.is_settled() {
+            sim.step();
+        }
+        for _ in 0..600 {
+            sim.drift_step(1.0 / 60.0);
+        }
+        for i in 0..sim.len() {
+            for j in i + 1..sim.len() {
+                let d = sim.box_center(j) - sim.box_center(i);
+                let need_x = sim.extents[i].half.x + sim.extents[j].half.x;
+                let need_y = sim.extents[i].half.y + sim.extents[j].half.y;
+                assert!(
+                    d.x.abs() >= need_x * 0.95 || d.y.abs() >= need_y * 0.95,
+                    "节点 {i} 和 {j} 的标签压在一起了: {d:?}"
+                );
+            }
+        }
+    }
+
     /// 一堆互不相连的词应该排成一个圆盘：宽高相当，且中间不能是空的。
     #[test]
     fn disconnected_nodes_form_a_disc() {
         let ids: Vec<u32> = (0..200).collect();
-        let sim = Sim::new(ids, Vec::new());
+        let sim = Sim::new(ids, Vec::new(), fake_extents(200));
         assert_eq!(sim.component_count(), 200);
 
         let b = sim.bounds();

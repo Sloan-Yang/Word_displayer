@@ -5,14 +5,9 @@ use egui::{
     Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Vec2,
 };
 
-use crate::layout::Sim;
+use crate::hotkey;
+use crate::layout::{self, Sim};
 use crate::vocab::Graph;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ColorMode {
-    Component,
-    Recency,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Theme {
@@ -20,82 +15,116 @@ enum Theme {
     Dark,
 }
 
+/// 词团配色。
+///
+/// 一个视觉属性只表达一种含义 —— 颜色只表示「属于哪个词团」，
+/// 别的什么都不代表。所以这里是一组饱和度压得比较低的柔和色，
+/// 按词团序号循环取用，而不是每个团都算一个新色相。
+const CLUSTER_LIGHT: [Color32; 6] = [
+    Color32::from_rgb(0x5B, 0x8D, 0xEF), // 蓝
+    Color32::from_rgb(0x47, 0xB8, 0xB2), // 青
+    Color32::from_rgb(0x77, 0xB8, 0x5C), // 绿
+    Color32::from_rgb(0xE6, 0xA3, 0x4A), // 橙
+    Color32::from_rgb(0xDF, 0x6B, 0x63), // 红
+    Color32::from_rgb(0x95, 0x75, 0xCD), // 紫
+];
+
+/// 单词在世界坐标下的基准字号。渲染时乘以 zoom，所以节点占的地方
+/// 在世界坐标里是固定的 —— 这是「让单词参与碰撞」的前提。
+const LABEL_FONT: f32 = 13.0;
+/// 窗口边缘多宽的一圈用来拖拽改变大小
+const RESIZE_EDGE: f32 = 7.0;
+/// 窗口的圆角半径（逻辑像素）。给得大一点，是圆角长方形而不是普通方窗
+const WINDOW_RADIUS: f32 = 34.0;
+/// 窗口的默认尺寸，也是被拖得过小时的复原尺寸
+const DEFAULT_WINDOW: egui::Vec2 = egui::vec2(1440.0, 900.0);
+/// 小于这个尺寸就认为已经没法操作了
+const MIN_WINDOW: egui::Vec2 = egui::vec2(420.0, 320.0);
+
 /// 画布上所有颜色都从这里取，换主题时不会漏掉某个硬编码的色值。
 struct Palette {
-    bg_top: Color32,
-    bg_bottom: Color32,
-    grid: Color32,
-    grid_alpha: f32,
-    edge: [u8; 3],
-    edge_hot: Color32,
-    label: Color32,
-    label_dim: Color32,
-    ring_selected: Color32,
-    ring_hover: Color32,
-    ring_search: Color32,
+    panel: Color32,
+    /// 平时的连线：非常淡
+    edge_base: Color32,
+    /// 有节点被选中/悬停时，无关连线退到这个浓度
+    edge_mute: Color32,
+    text_strong: Color32,
+    text_weak: Color32,
+    accent: Color32,
     tip_bg: Color32,
     tip_border: Color32,
-    tip_text: Color32,
-    status: Color32,
-    /// 节点配色的饱和度/明度，亮底要更深更饱和才压得住
-    node_sat: f32,
-    node_val: f32,
-    /// 淡化非邻居节点时往这个颜色混，亮底往白混、暗底往黑混
-    fade_to: Color32,
+    /// 词团色往这个颜色混，调出气泡的填充；亮色主题混白，暗色主题混黑
+    chip_base: Color32,
+    /// 填充的上下两端各混多少
+    chip_top_mix: f32,
+    chip_bottom_mix: f32,
+    /// 描边色相对原色的深浅
+    chip_border_mix: f32,
+    /// 被淡化的节点往背景混多少
+    dim: f32,
+    /// 背景图的染色。图本身是浅色的，暗色主题靠这个把它压暗
+    bg_tint: Color32,
+    /// 盖在背景图上的一层薄纱，用来压住底图、保证胶囊读得清
+    bg_veil: Color32,
+    /// 自绘窗口的描边
+    window_border: Color32,
+    /// 浮在圆里的控制卡片底色
+    card: Color32,
 }
 
 impl Palette {
     fn of(theme: Theme) -> Palette {
         match theme {
             Theme::Light => Palette {
-                bg_top: Color32::from_rgb(252, 252, 251),
-                bg_bottom: Color32::from_rgb(238, 238, 236),
-                grid: Color32::from_rgb(40, 40, 45),
-                grid_alpha: 42.0,
-                edge: [96, 102, 116],
-                edge_hot: Color32::from_rgb(196, 104, 18),
-                label: Color32::from_rgb(28, 28, 32),
-                label_dim: Color32::from_rgb(176, 176, 180),
-                ring_selected: Color32::from_rgb(20, 20, 24),
-                ring_hover: Color32::from_rgb(110, 110, 118),
-                ring_search: Color32::from_rgb(214, 122, 16),
-                tip_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 245),
-                tip_border: Color32::from_rgb(198, 198, 200),
-                tip_text: Color32::from_rgb(28, 28, 32),
-                status: Color32::from_rgb(150, 150, 155),
-                node_sat: 0.78,
-                node_val: 0.74,
-                fade_to: Color32::from_rgb(245, 245, 244),
+                panel: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+                edge_base: Color32::from_rgba_unmultiplied(0x5A, 0x69, 0x7D, 74),
+                edge_mute: Color32::from_rgba_unmultiplied(0x5A, 0x69, 0x7D, 20),
+                text_strong: Color32::from_rgb(0x25, 0x2A, 0x34),
+                text_weak: Color32::from_rgb(0x73, 0x7A, 0x86),
+                accent: Color32::from_rgb(0xE6, 0x8A, 0x2A),
+                tip_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 246),
+                tip_border: Color32::from_rgb(0xDD, 0xE1, 0xE7),
+                chip_base: Color32::WHITE,
+                chip_top_mix: 0.86,
+                chip_bottom_mix: 0.68,
+                chip_border_mix: 0.30,
+                dim: 0.80,
+                bg_tint: Color32::WHITE,
+                bg_veil: Color32::TRANSPARENT,
+                window_border: Color32::from_rgb(0xD8, 0xDD, 0xE4),
+                card: Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 232),
             },
             Theme::Dark => Palette {
-                bg_top: Color32::from_rgb(31, 31, 33),
-                bg_bottom: Color32::from_rgb(20, 20, 21),
-                grid: Color32::from_rgb(180, 180, 180),
-                grid_alpha: 34.0,
-                edge: [165, 168, 175],
-                edge_hot: Color32::from_rgb(255, 214, 130),
-                label: Color32::from_gray(232),
-                label_dim: Color32::from_gray(90),
-                ring_selected: Color32::WHITE,
-                ring_hover: Color32::from_gray(220),
-                ring_search: Color32::from_rgb(255, 200, 90),
-                tip_bg: Color32::from_rgba_unmultiplied(24, 28, 36, 235),
-                tip_border: Color32::from_gray(70),
-                tip_text: Color32::from_gray(235),
-                status: Color32::from_gray(110),
-                node_sat: 0.55,
-                node_val: 0.95,
-                fade_to: Color32::from_rgb(24, 24, 26),
+                panel: Color32::from_rgb(0x21, 0x23, 0x28),
+                edge_base: Color32::from_rgba_unmultiplied(0xA8, 0xB2, 0xC0, 70),
+                edge_mute: Color32::from_rgba_unmultiplied(0xA8, 0xB2, 0xC0, 22),
+                text_strong: Color32::from_rgb(0xE8, 0xEB, 0xF0),
+                text_weak: Color32::from_rgb(0x8A, 0x92, 0x9E),
+                accent: Color32::from_rgb(0xF0, 0xA9, 0x4C),
+                tip_bg: Color32::from_rgba_unmultiplied(0x2A, 0x2D, 0x34, 246),
+                tip_border: Color32::from_rgb(0x3C, 0x40, 0x48),
+                chip_base: Color32::from_rgb(0x1E, 0x20, 0x25),
+                chip_top_mix: 0.55,
+                chip_bottom_mix: 0.72,
+                chip_border_mix: 0.15,
+                dim: 0.82,
+                // 乘法染色：把这张浅色底图压成深蓝灰
+                bg_tint: Color32::from_rgb(52, 56, 64),
+                bg_veil: Color32::from_rgba_unmultiplied(16, 17, 20, 92),
+                window_border: Color32::from_rgb(0x3A, 0x3E, 0x46),
+                card: Color32::from_rgba_unmultiplied(0x25, 0x28, 0x2E, 236),
             },
         }
     }
 
-    fn panel_fill(&self) -> Color32 {
-        self.bg_bottom
+    /// 某个词团的主色
+    fn cluster(&self, component: u32) -> Color32 {
+        CLUSTER_LIGHT[component as usize % CLUSTER_LIGHT.len()]
     }
 }
 
 pub struct App {
+    ctx: egui::Context,
     graph: Graph,
     load_error: Option<String>,
     root_input: String,
@@ -114,6 +143,27 @@ pub struct App {
     /// 布局还在铺开时持续跟拍；一旦用户自己平移/缩放就交还控制权。
     auto_fit: bool,
 
+    // 后台常驻 / 全局热键
+    hotkey_signal: hotkey::Signal,
+    hotkey_registered: bool,
+    /// 只有点了「退出」才真的关掉，点 X 是收进后台
+    allow_exit: bool,
+    /// 首帧才建图：量文字尺寸要用字体，而字体在 Context::run 之前还没准备好
+    pending_rebuild: bool,
+    /// 还剩几帧去尝试摆窗口位置。屏幕尺寸要等 winit 报上来，不是立刻就有的
+    place_window: u32,
+    /// 连续多少帧观测到窗口小得没法用了。跨屏换 DPI 时会瞬间读到异常值，
+    /// 必须连续成立一段时间才动手，否则会误伤
+    tiny_frames: u32,
+    /// 背景图。解码要用 Context，所以也是首帧才上传
+    backdrop: Option<egui::TextureHandle>,
+    /// 左侧栏的背景图
+    sidebar_backdrop: Option<egui::TextureHandle>,
+    /// 左侧面板是否展开
+    show_sidebar: bool,
+    /// 下一帧把输入焦点交给搜索框（Ctrl+F 触发）
+    focus_search: bool,
+
     // 交互
     selected: Option<u32>,
     hovered: Option<u32>,
@@ -126,10 +176,7 @@ pub struct App {
     theme: Theme,
     /// 已经套用到 egui 上的主题，变了才重新设置样式
     applied_theme: Option<Theme>,
-    color_mode: ColorMode,
-    show_labels: bool,
-    label_limit: usize,
-    edge_alpha: u8,
+    edge_alpha: u16,
     node_scale: f32,
 }
 
@@ -142,8 +189,12 @@ impl App {
             Err(e) => (Graph::default(), Some(e)),
         };
 
+        let hotkey_signal = hotkey::new_signal();
+        let hotkey_registered = hotkey::spawn(cc.egui_ctx.clone(), hotkey_signal.clone());
+
         let last = graph.weeks.len().saturating_sub(1);
-        let mut app = App {
+        let app = App {
+            ctx: cc.egui_ctx.clone(),
             root_input: root.to_string_lossy().to_string(),
             week_lo: last.saturating_sub(3),
             week_hi: last,
@@ -153,7 +204,7 @@ impl App {
             focus: None,
             graph,
             load_error,
-            sim: Sim::new(Vec::new(), Vec::new()),
+            sim: Sim::new(Vec::new(), Vec::new(), Vec::new()),
             cam: Pos2::ZERO,
             zoom: 1.0,
             auto_fit: true,
@@ -161,18 +212,50 @@ impl App {
             hovered: None,
             dragging: None,
             search: String::new(),
+            hotkey_signal,
+            hotkey_registered,
+            allow_exit: false,
+            pending_rebuild: true,
+            place_window: 60,
+            tiny_frames: 0,
+            backdrop: None,
+            sidebar_backdrop: None,
+            show_sidebar: true,
+            focus_search: false,
             drifting: true,
             drift_speed: 1.0,
             theme: Theme::Light,
             applied_theme: None,
-            color_mode: ColorMode::Component,
-            show_labels: true,
-            label_limit: 600,
-            edge_alpha: 60,
+            edge_alpha: 100,
             node_scale: 1.0,
         };
-        app.rebuild();
+        // 这里不能 rebuild：字体还没就绪，量不了单词的宽度
         app
+    }
+
+    // -------------------------------------------------------- 显示 / 隐藏
+
+    /// 窗口内的 Ctrl+9，以及点 X 时收进后台而不是退出。
+    ///
+    /// 呼出是热键线程直接做的（窗口藏着时主线程根本不会被调用），
+    /// 这里只管「藏起来」这半边。
+    fn handle_visibility(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+
+        // 刚被热键唤醒，清账即可
+        self.hotkey_signal.store(false, Ordering::SeqCst);
+
+        // 窗口有焦点时也认 Ctrl+9，全局热键没注册上时这就是唯一的入口
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Num9)) {
+            hotkey::hide();
+            return;
+        }
+
+        // 点 X：收起来，别真的退出
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_exit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            hotkey::hide();
+        }
     }
 
     // ------------------------------------------------------------ 选点与重建
@@ -250,13 +333,46 @@ impl App {
         }
         edges.sort_unstable();
 
-        self.sim = Sim::new(ids, edges);
+        let extents = ids.iter().map(|&g| self.extent_of(g, &local)).collect();
+        self.sim = Sim::new(ids, edges, extents);
         self.auto_fit = true;
         if let Some(sel) = self.selected {
             if !self.sim.local.contains_key(&sel) {
                 self.selected = None;
             }
         }
+    }
+
+    /// 一个节点的字号（世界单位）。连接数越多的词越大 ——
+    /// 「节点大小」这个视觉属性只表达连接数，不表达别的。
+    fn node_font(&self, degree: usize) -> f32 {
+        let f = LABEL_FONT * (0.92 + 0.17 * (degree as f32).sqrt());
+        f.clamp(LABEL_FONT * 0.92, LABEL_FONT * 2.0) * self.node_scale
+    }
+
+    /// 量出一个节点占多大地方（世界单位）。
+    ///
+    /// 节点就是那颗写着单词的胶囊本身，所以包围盒 = 文字尺寸 + 内边距，
+    /// 碰撞体和看到的形状完全一致，字母永远不会压到别人身上。
+    fn extent_of(&self, global: u32, local: &HashMap<u32, usize>) -> layout::Extent {
+        let node = &self.graph.nodes[global as usize];
+        // 度数要按当前视图里的邻居算，和画出来的大小保持一致
+        let deg = node
+            .neighbors
+            .iter()
+            .filter(|nb| local.contains_key(nb))
+            .count();
+        let font = self.node_font(deg);
+        let size = self.ctx.fonts(|f| {
+            f.layout_no_wrap(
+                node.name.clone(),
+                egui::FontId::proportional(font),
+                Color32::WHITE,
+            )
+            .size()
+        });
+        let half = Vec2::new(size.x * 0.5 + font * 0.62, size.y * 0.5 + font * 0.34);
+        layout::Extent { half, off_y: 0.0 }
     }
 
     fn reload(&mut self) {
@@ -292,22 +408,21 @@ impl App {
         (b.center(), zx.min(zy).clamp(0.02, 2.5))
     }
 
-    /// 布局铺开的过程中平滑跟拍，收敛后停在最终视野上。
+    /// 平滑跟拍，保证整张图始终在视野里。
+    ///
+    /// 不能「收敛后就撒手」—— 气泡漂浮会继续把图撑大一点，撒手之后边上的词
+    /// 就飘到画外去了。所以一直跟，但加一个死区：差得不多就不动，
+    /// 免得镜头跟着气泡一起晃。用户自己缩放/平移之后就交还控制权。
     fn follow_layout(&mut self, viewport: Rect) {
         let (cam, zoom) = self.fit_target(viewport);
-        let t = if self.sim.is_settled() { 0.2 } else { 0.12 };
+        let off = (cam - self.cam).length();
+        let ratio = (zoom / self.zoom.max(1e-6) - 1.0).abs();
+        if off < 8.0 && ratio < 0.02 {
+            return;
+        }
+        let t = if self.sim.is_settled() { 0.06 } else { 0.12 };
         self.cam += (cam - self.cam) * t;
         self.zoom += (zoom - self.zoom) * t;
-
-        // 跟到位了就不用再每帧重绘
-        if self.sim.is_settled()
-            && (cam - self.cam).length() < 0.5
-            && (zoom - self.zoom).abs() < 0.001
-        {
-            self.cam = cam;
-            self.zoom = zoom;
-            self.auto_fit = false;
-        }
     }
 
     fn to_screen(&self, center: Pos2, p: Pos2) -> Pos2 {
@@ -326,208 +441,541 @@ impl App {
         }
     }
 
-    fn radius(&self, local: usize) -> f32 {
-        let deg = self.sim.degree[local] as f32;
-        (7.0 + 3.0 * deg.sqrt()) * self.node_scale
-    }
-
-    fn node_color(&self, global: u32, pal: &Palette) -> Color32 {
+    /// 节点的不透明度：越接近所选时间范围的末端越实，越旧越淡。
+    /// 「透明度」这个视觉属性只表达时间远近。
+    fn recency_alpha(&self, global: u32) -> f32 {
         let node = &self.graph.nodes[global as usize];
-        match self.color_mode {
-            ColorMode::Component => {
-                let h = (node.component as f32 * 0.381_966_0).fract();
-                hsv(h, pal.node_sat, pal.node_val)
-            }
-            ColorMode::Recency => {
-                let total = self.graph.weeks.len().max(1) as f32;
-                let t = node.last_week().unwrap_or(0) as f32 / total;
-                // 旧 -> 新：靛蓝到暖橙
-                hsv(0.62 - 0.50 * t, pal.node_sat, pal.node_val * (0.85 + 0.15 * t))
-            }
+        let Some(last) = node.last_week() else {
+            return 0.5;
+        };
+        let (lo, hi) = (self.week_lo as f32, self.week_hi as f32);
+        if (last as f32) > hi {
+            return 1.0;
         }
+        if (last as f32) < lo {
+            // 靠展开跳数带进来的邻居，本身不在时间范围内
+            return 0.5;
+        }
+        let span = (hi - lo).max(1.0);
+        0.6 + 0.4 * ((last as f32 - lo) / span)
     }
 }
 
 impl eframe::App for App {
+    /// 窗口是透明的，圆角之外的地方要真的透出去，所以清屏色必须全透明。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 藏起来的时候什么都不画。winit 即使在窗口隐藏时也会继续空转，
+        // 光是提前 return 仍会吃掉大半个核，所以这里主动睡一下把它按住 ——
+        // 隐藏期间没有任何事件要响应，热键线程是直接调 Win32 显示窗口的，
+        // 不依赖这个循环。
+        if !hotkey::is_visible() {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            return;
+        }
+        self.handle_visibility(ctx);
+
         if self.applied_theme != Some(self.theme) {
             apply_theme(ctx, self.theme);
             self.applied_theme = Some(self.theme);
         }
         let pal = Palette::of(self.theme);
 
-        self.side_panel(ctx);
-        self.detail_panel(ctx);
+        self.place_window_once(ctx);
+
+        if self.pending_rebuild {
+            self.pending_rebuild = false;
+            self.rebuild();
+            self.backdrop = load_texture(ctx, "backdrop", BKG_BYTES);
+            self.sidebar_backdrop = load_texture(ctx, "sidebar", TAB_BKG_BYTES);
+        }
+
+        // Ctrl+B 收放左侧面板
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::B)) {
+            self.show_sidebar = !self.show_sidebar;
+        }
+        // Ctrl+F 跳到搜索框。侧栏要是收着的，先展开，否则搜索框根本没被画出来，
+        // 也就无处可聚焦
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            self.show_sidebar = true;
+            self.focus_search = true;
+        }
+
+        // Ctrl+0 把窗口重新摆回「当前所在这块屏幕的顶端居中」。
+        // 多屏之间来回拖之后位置乱了，用这个一键归位。
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Num0)) {
+            self.place_window = 60;
+        }
+
+        // F11 全屏。放在这里而不是画布里，是因为焦点在卡片上时画布收不到按键
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            let full = self.is_fullscreen(ctx);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+        }
+
+        // Esc：正在打字就先退出输入框，否则关掉右侧详情面板。
+        // 放在这里而不是画布里，是因为焦点在侧栏时画布收不到按键。
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            match ctx.memory(|m| m.focused()) {
+                Some(id) => ctx.memory_mut(|m| m.surrender_focus(id)),
+                None => self.selected = None,
+            }
+        }
+
+        // 圆角半径要换算成物理像素，高 DPI 屏上才不会偏小
+        let radius = self.effective_radius(ctx);
+        hotkey::apply_window_shape((radius * ctx.pixels_per_point()).round() as i32);
+        self.paint_window_frame(ctx, &pal);
+        self.handle_resize(ctx);
+
+        // 画布铺满整个圆；控制面板浮在圆里面，不再是从上到下的一条
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(pal.bg_bottom))
+            .frame(egui::Frame::NONE)
             .show(ctx, |ui| self.graph_view(ui, &pal));
+        if self.show_sidebar {
+            self.side_panel(ctx, &pal);
+        }
+        self.detail_panel(ctx, &pal);
 
         if !self.sim.is_settled() || self.auto_fit || self.drifting {
-            ctx.request_repaint();
+            // 排一个定时重绘而不是「立刻」，否则会以显卡能跑多快就跑多快的
+            // 速度空转。气泡本来就飘得慢，30fps 完全够看，而且省一半电。
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
     }
 }
 
 impl App {
+    // -------------------------------------------------------- 自绘窗口外框
+
+    fn is_maximized(&self, ctx: &egui::Context) -> bool {
+        ctx.input(|i| i.viewport().maximized.unwrap_or(false))
+    }
+
+    /// 把窗口摆到「当前所在这块屏幕的顶端、水平居中」。启动时跑一次，
+    /// 之后可以用 Ctrl+0 手动再来一次。
+    ///
+    /// 不能在 `ViewportBuilder` 里写死坐标 —— 那时候还不知道屏幕多大。
+    /// 屏幕尺寸要等 winit 报上来，前几帧可能都是 None，所以这里重试几十帧，
+    /// 摆成功或者次数用完就不再管，免得跟用户抢窗口。
+    fn place_window_once(&mut self, ctx: &egui::Context) {
+        if self.place_window == 0 {
+            return;
+        }
+        self.place_window -= 1;
+
+        let geom = ctx.input(|i| {
+            let v = i.viewport();
+            v.monitor_size
+                .zip(v.outer_rect.map(|r| r.size()))
+        });
+        let Some((monitor, window)) = geom else {
+            return;
+        };
+        if monitor.x <= 1.0 || window.x <= 1.0 {
+            return;
+        }
+        // outer_rect 是屏幕绝对坐标，多屏时要先找出窗口现在在哪块屏上，
+        // 再在那块屏的范围内居中 —— 直接用 (0, monitor) 会把窗口甩回主屏
+        let origin = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(Pos2::ZERO);
+        let screen_index = (origin.x / monitor.x).floor();
+        let left = screen_index * monitor.x;
+        let x = left + ((monitor.x - window.x) * 0.5).max(0.0);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(x, 0.0)));
+        self.place_window = 0;
+    }
+
+    fn is_fullscreen(&self, ctx: &egui::Context) -> bool {
+        ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
+    }
+
+    /// 当前该用多大的圆角。铺满屏幕时必须是 0 —— 圆角会把屏幕四角抠掉。
+    fn effective_radius(&self, ctx: &egui::Context) -> f32 {
+        if self.is_fullscreen(ctx) || self.is_maximized(ctx) {
+            0.0
+        } else {
+            WINDOW_RADIUS
+        }
+    }
+
+    /// 整个窗口是一块圆角长方形。背景图铺满它，边上描一圈细线。
+    ///
+    /// 系统层面的裁剪由 `hotkey::apply_window_shape` 用 SetWindowRgn 完成，
+    /// 这里只负责画；两者形状必须一致，否则会露边或者被切掉。
+    fn paint_window_frame(&self, ctx: &egui::Context, pal: &Palette) {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let screen = ctx.screen_rect();
+        let pts = round_rect_points(screen.shrink(0.5), [self.effective_radius(ctx); 4]);
+
+        painter.add(Shape::convex_polygon(pts.clone(), pal.panel, Stroke::NONE));
+        if let Some(tex) = &self.backdrop {
+            painter.add(textured_fan(screen, &pts, tex.id(), pal.bg_tint));
+            if pal.bg_veil.a() > 0 {
+                painter.add(Shape::convex_polygon(
+                    pts.clone(),
+                    pal.bg_veil,
+                    Stroke::NONE,
+                ));
+            }
+        }
+        painter.add(Shape::closed_line(pts, Stroke::new(1.2, pal.window_border)));
+    }
+
+    /// 窗口里能放东西的区域。圆角长方形不像正圆那样浪费，
+    /// 只要躲开四个圆角就行。
+    fn inner_square(&self, ctx: &egui::Context) -> Rect {
+        // 全屏时圆角是 0，但仍留一点边距，内容别顶到屏幕边上
+        ctx.screen_rect()
+            .shrink((self.effective_radius(ctx) * 0.42).max(12.0))
+    }
+
+    fn card_width(&self, ctx: &egui::Context) -> f32 {
+        268.0_f32.min(self.inner_square(ctx).width() * 0.34)
+    }
+
+    /// 真正留给词图的地方：内接正方形再去掉浮在上面的卡片。
+    /// 不减掉的话图会被卡片压住一大半。
+    fn content_rect(&self, ctx: &egui::Context) -> Rect {
+        let mut r = self.inner_square(ctx);
+        if self.show_sidebar {
+            r.min.x += self.card_width(ctx) + 14.0;
+        }
+        if self.selected.is_some() {
+            r.max.x -= 230.0_f32.min(r.width() * 0.42) + 14.0;
+        }
+        if r.width() < 120.0 {
+            // 卡片全开时窗口太小，就别再让了，宁可压一点
+            r = self.inner_square(ctx);
+        }
+        r
+    }
+
+    /// 没有系统边框了，改变窗口大小得自己来：贴着窗口边一圈留出几个像素，
+    /// 在那儿按下就交给系统去拖。
+    fn handle_resize(&mut self, ctx: &egui::Context) {
+        use egui::viewport::ResizeDirection;
+        if self.is_maximized(ctx) || self.is_fullscreen(ctx) {
+            return;
+        }
+        let screen = ctx.screen_rect();
+
+        // 兜底：窗口一旦被拖成没法操作的大小，直接拉回默认尺寸。
+        // 无边框窗口在某些情况下不受 min_inner_size 约束，缩成几个像素之后
+        // 连边都抓不住，只能自己救自己。
+        //
+        // 但必须**连续**观测到才算数：窗口在不同 DPI 的显示器之间移动时，
+        // 中间那几帧 screen_rect 会读到过渡态的异常值，一帧就动手的话
+        // 会在跨屏时把窗口莫名其妙地重置掉。
+        if screen.width() < MIN_WINDOW.x || screen.height() < MIN_WINDOW.y {
+            self.tiny_frames += 1;
+            if self.tiny_frames > 45 {
+                self.tiny_frames = 0;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(DEFAULT_WINDOW));
+            }
+            return;
+        }
+        self.tiny_frames = 0;
+
+        let Some(p) = ctx.input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        if !screen.contains(p) {
+            return;
+        }
+
+        let left = p.x <= screen.left() + RESIZE_EDGE;
+        let right = p.x >= screen.right() - RESIZE_EDGE;
+        let top = p.y <= screen.top() + RESIZE_EDGE;
+        let bottom = p.y >= screen.bottom() - RESIZE_EDGE;
+
+        let (dir, cursor) = match (left, right, top, bottom) {
+            (true, _, true, _) => (
+                Some(ResizeDirection::NorthWest),
+                egui::CursorIcon::ResizeNwSe,
+            ),
+            (_, true, true, _) => (
+                Some(ResizeDirection::NorthEast),
+                egui::CursorIcon::ResizeNeSw,
+            ),
+            (true, _, _, true) => (
+                Some(ResizeDirection::SouthWest),
+                egui::CursorIcon::ResizeNeSw,
+            ),
+            (_, true, _, true) => (
+                Some(ResizeDirection::SouthEast),
+                egui::CursorIcon::ResizeNwSe,
+            ),
+            (true, ..) => (Some(ResizeDirection::West), egui::CursorIcon::ResizeHorizontal),
+            (_, true, ..) => (
+                Some(ResizeDirection::East),
+                egui::CursorIcon::ResizeHorizontal,
+            ),
+            (_, _, true, _) => (Some(ResizeDirection::North), egui::CursorIcon::ResizeVertical),
+            (_, _, _, true) => (Some(ResizeDirection::South), egui::CursorIcon::ResizeVertical),
+            _ => (None, egui::CursorIcon::Default),
+        };
+
+        if let Some(dir) = dir {
+            ctx.set_cursor_icon(cursor);
+            if ctx.input(|i| i.pointer.primary_pressed()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+            }
+        }
+    }
+
+}
+
+impl App {
     // ------------------------------------------------------------ 左侧面板
 
-    fn side_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("controls")
-            .default_width(280.0)
+    /// 控制面板。圆形窗口里放不下从上到下的一条竖栏，改成浮在圆内左侧的卡片。
+    fn side_panel(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let inner = self.inner_square(ctx);
+        let card = Rect::from_min_size(
+            inner.left_top(),
+            egui::vec2(self.card_width(ctx), inner.height()),
+        );
+
+        egui::Area::new(egui::Id::new("controls"))
+            .fixed_pos(card.min)
+            .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.heading("单词图网");
-                ui.add_space(4.0);
-
-                if let Some(err) = self.load_error.clone() {
-                    ui.colored_label(Color32::from_rgb(200, 60, 60), err);
-                }
-
-                egui::CollapsingHeader::new("数据源")
-                    .default_open(false)
+                ui.set_max_width(card.width());
+                ui.set_max_height(card.height());
+                egui::Frame::NONE
+                    .fill(pal.card)
+                    .stroke(Stroke::new(1.0, pal.window_border))
+                    .corner_radius(16)
+                    .inner_margin(egui::Margin::symmetric(14, 12))
                     .show(ui, |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.root_input).desired_width(f32::INFINITY));
-                        if ui.button("重新加载").clicked() {
-                            self.reload();
+                        ui.set_width(card.width() - 28.0);
+                        // 卡片底纹用 tab_bkg。先占一个空位，等内容画完知道了
+                        // 真实高度再回填 —— 直接用 max_rect 的话底纹会一路
+                        // 拖到窗口底部，而卡片本身是贴着内容收的。
+                        let bg_slot = ui.painter().add(Shape::Noop);
+
+                        // 没有标题栏了，窗口靠拖这张卡片的空白处来移动
+                        let drag = ui.interact(
+                            ui.max_rect(),
+                            ui.id().with("window-drag"),
+                            Sense::click_and_drag(),
+                        );
+                        if drag.drag_started() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                         }
-                    });
 
-                ui.separator();
+                        ui.label(
+                            RichText::new("辞境")
+                                .size(21.0)
+                                .strong()
+                                .color(pal.text_strong),
+                        );
+                        ui.label(
+                            RichText::new("LEXIS · Word Atlas")
+                                .size(10.0)
+                                .color(pal.text_weak),
+                        );
+                        ui.add_space(12.0);
 
-                // ---- 时间筛选 ----
-                ui.label(RichText::new("时间筛选").strong());
-                let n_weeks = self.graph.weeks.len();
-                if n_weeks == 0 {
-                    ui.weak("没有读到任何周标签");
-                } else {
-                    let labels: Vec<String> = self.graph.weeks.iter().map(|w| w.label()).collect();
-                    let l1 = labels.clone();
-                    let l2 = labels.clone();
-                    let max = n_weeks - 1;
-
-                    let mut changed = false;
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.week_lo, 0..=max)
-                                .text("起")
-                                .custom_formatter(move |v, _| {
-                                    l1.get(v as usize).cloned().unwrap_or_default()
-                                }),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut self.week_hi, 0..=max)
-                                .text("止")
-                                .custom_formatter(move |v, _| {
-                                    l2.get(v as usize).cloned().unwrap_or_default()
-                                }),
-                        )
-                        .changed();
-                    if self.week_lo > self.week_hi {
-                        // 拖过头时把另一端顶着走
-                        if changed {
-                            self.week_hi = self.week_lo;
+                        if let Some(err) = self.load_error.clone() {
+                            ui.colored_label(Color32::from_rgb(0xDF, 0x6B, 0x63), err);
+                            ui.add_space(6.0);
                         }
-                    }
 
-                    ui.horizontal_wrapped(|ui| {
-                        for (text, span) in [("最近 1 周", 1usize), ("4 周", 4), ("12 周", 12)] {
-                            if ui.small_button(text).clicked() {
-                                self.week_hi = max;
-                                self.week_lo = max.saturating_sub(span - 1);
-                                changed = true;
-                            }
+                        egui::ScrollArea::vertical()
+                            .max_height(card.height() - 150.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                self.time_controls(ui);
+                                ui.add_space(12.0);
+                                self.scope_controls(ui);
+                                ui.add_space(12.0);
+                                self.search_controls(ui);
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("重置视图").clicked() {
+                                        self.auto_fit = true;
+                                        self.selected = None;
+                                    }
+                                    ui.selectable_value(&mut self.theme, Theme::Light, "亮");
+                                    ui.selectable_value(&mut self.theme, Theme::Dark, "暗");
+                                });
+                                ui.add_space(10.0);
+                                self.advanced_controls(ui);
+                            });
+
+                        ui.add_space(8.0);
+                        if self.hotkey_registered {
+                            ui.weak("Ctrl+9 收进后台 · Ctrl+B 收起本卡");
+                        } else {
+                            ui.weak("Ctrl+9 被占用，只在窗口内生效");
                         }
-                        if ui.small_button("全部").clicked() {
-                            self.week_lo = 0;
-                            self.week_hi = max;
-                            changed = true;
-                        }
-                    });
+                        ui.weak("Ctrl+F 搜索 · Esc 关详情 · F 复位视野 · F11 全屏");
+                        ui.weak("方向键平移 · +/− 缩放 · 按住 Shift 加速");
+                        ui.weak("Ctrl+0 窗口归位（多屏拖乱了用它）");
+                        ui.weak("拖本卡空白处可移动窗口");
 
-                    if changed {
-                        self.focus = None;
-                        self.rebuild();
-                    }
-                }
-
-                ui.add_space(6.0);
-                let mut structural = false;
-                structural |= ui
-                    .add(egui::Slider::new(&mut self.hops, 0..=3).text("扩展邻居跳数"))
-                    .changed();
-                structural |= ui.checkbox(&mut self.hide_isolated, "隐藏孤立节点").changed();
-                if structural {
-                    self.rebuild();
-                }
-
-                if let Some(f) = self.focus {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("聚焦: {}", self.graph.nodes[f as usize].name)).italics());
-                        if ui.small_button("✕").clicked() {
-                            self.focus = None;
-                            self.rebuild();
-                        }
-                    });
-                }
-
-                ui.separator();
-
-                // ---- 搜索 ----
-                ui.label(RichText::new("搜索").strong());
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("输入单词，回车定位")
-                        .desired_width(f32::INFINITY),
-                );
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.jump_to_search();
-                }
-
-                ui.separator();
-
-                // ---- 外观 ----
-                egui::CollapsingHeader::new("外观")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("主题");
-                            ui.selectable_value(&mut self.theme, Theme::Light, "亮色");
-                            ui.selectable_value(&mut self.theme, Theme::Dark, "暗色");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("配色");
-                            ui.selectable_value(&mut self.color_mode, ColorMode::Component, "词群");
-                            ui.selectable_value(&mut self.color_mode, ColorMode::Recency, "新旧");
-                        });
-                        ui.checkbox(&mut self.drifting, "气泡漂浮");
-                        if self.drifting {
-                            ui.add(
-                                egui::Slider::new(&mut self.drift_speed, 0.1..=2.5).text("漂浮速度"),
+                        if let Some(tex) = &self.sidebar_backdrop {
+                            ui.painter().set(
+                                bg_slot,
+                                textured_round_rect(
+                                    ui.min_rect().expand(13.0),
+                                    [16.0; 4],
+                                    tex.id(),
+                                    pal.bg_tint.gamma_multiply(0.9),
+                                ),
                             );
                         }
-                        ui.checkbox(&mut self.show_labels, "显示单词标签");
-                        ui.add(egui::Slider::new(&mut self.label_limit, 50..=3000).text("标签上限"));
-                        ui.add(egui::Slider::new(&mut self.node_scale, 0.4..=2.5).text("节点大小"));
-                        ui.add(egui::Slider::new(&mut self.edge_alpha, 10..=180).text("连线浓度"));
-                        if ui.button("重新排布 (R)").clicked() {
-                                        self.rebuild();
-                        }
                     });
+            });
+    }
 
-                ui.separator();
+    fn time_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("时间范围").strong());
+        ui.add_space(4.0);
+        let n_weeks = self.graph.weeks.len();
+        if n_weeks == 0 {
+            ui.weak("没有读到任何周标签");
+            return;
+        }
+        let labels: Vec<String> = self.graph.weeks.iter().map(|w| w.label()).collect();
+        let (l1, l2) = (labels.clone(), labels.clone());
+        let max = n_weeks - 1;
 
-                // ---- 统计 ----
-                let shown = self.sim.len();
-                let edges = self.sim.edges.len();
-                ui.label(format!(
-                    "显示 {shown} 个词 / {edges} 条联系 / {} 个词团",
+        let (lo_text, hi_text) = (
+            labels[self.week_lo.min(max)].clone(),
+            labels[self.week_hi.min(max)].clone(),
+        );
+
+        let mut changed = false;
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.week_lo, 0..=max)
+                    .show_value(false)
+                    .text(lo_text)
+                    .custom_formatter(move |v, _| l1.get(v as usize).cloned().unwrap_or_default()),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.week_hi, 0..=max)
+                    .show_value(false)
+                    .text(hi_text)
+                    .custom_formatter(move |v, _| l2.get(v as usize).cloned().unwrap_or_default()),
+            )
+            .changed();
+        if changed && self.week_lo > self.week_hi {
+            self.week_hi = self.week_lo;
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for (text, span) in [("本周", 1usize), ("4 周", 4), ("12 周", 12)] {
+                if ui.small_button(text).clicked() {
+                    self.week_hi = max;
+                    self.week_lo = max.saturating_sub(span - 1);
+                    changed = true;
+                }
+            }
+            if ui.small_button("全部").clicked() {
+                self.week_lo = 0;
+                self.week_hi = max;
+                changed = true;
+            }
+        });
+
+        if changed {
+            self.focus = None;
+            self.rebuild();
+        }
+    }
+
+    fn scope_controls(&mut self, ui: &mut egui::Ui) {
+        let mut structural = false;
+        structural |= ui
+            .add(egui::Slider::new(&mut self.hops, 0..=3).text("展开层数"))
+            .changed();
+
+        // 界面上说「显示」，内部存的是「隐藏」，这里翻一下
+        let mut show_isolated = !self.hide_isolated;
+        if ui.checkbox(&mut show_isolated, "显示孤立单词").changed() {
+            self.hide_isolated = !show_isolated;
+            structural = true;
+        }
+        if structural {
+            self.rebuild();
+        }
+
+        if let Some(f) = self.focus {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("聚焦 {}", self.graph.nodes[f as usize].name)).italics(),
+                );
+                if ui.small_button("×").clicked() {
+                    self.focus = None;
+                    self.rebuild();
+                }
+            });
+        }
+    }
+
+    fn search_controls(&mut self, ui: &mut egui::Ui) {
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut self.search)
+                .hint_text("搜索单词，回车定位  (Ctrl+F)")
+                .desired_width(f32::INFINITY),
+        );
+        if self.focus_search {
+            self.focus_search = false;
+            resp.request_focus();
+        }
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.jump_to_search();
+        }
+    }
+
+    /// 调参用的开关全塞进这里，默认收起 —— 主界面只留背单词真正会用到的东西。
+    fn advanced_controls(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("高级显示设置")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.checkbox(&mut self.drifting, "气泡漂浮");
+                if self.drifting {
+                    ui.add(egui::Slider::new(&mut self.drift_speed, 0.1..=2.5).text("漂浮速度"));
+                }
+                if ui
+                    .add(egui::Slider::new(&mut self.node_scale, 0.5..=2.0).text("单词大小"))
+                    .changed()
+                {
+                    // 大小变了，碰撞盒也得跟着变，只能重排
+                    self.rebuild();
+                }
+                ui.add(egui::Slider::new(&mut self.edge_alpha, 20..=260).text("连线浓度"));
+
+                ui.add_space(6.0);
+                ui.label(RichText::new("数据源").strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.root_input)
+                        .desired_width(f32::INFINITY),
+                );
+                if ui.button("重新加载").clicked() {
+                    self.reload();
+                }
+
+                ui.add_space(6.0);
+                ui.weak(format!(
+                    "显示 {} 个词 / {} 条联系 / {} 个词团",
+                    self.sim.len(),
+                    self.sim.edges.len(),
                     self.sim.component_count()
                 ));
                 let hidden = self.isolated_count();
                 if hidden > 0 {
-                    ui.weak(format!("另有 {hidden} 个没有联系的词被隐藏"));
+                    ui.weak(format!("{hidden} 个没有联系的词被隐藏"));
                 }
                 ui.weak(format!(
                     "库内共 {} 个词，{} 条联系，{} 周",
@@ -539,10 +987,11 @@ impl App {
                     ui.weak(format!("{} 个链接指向不存在的词", self.graph.dangling_links));
                 }
 
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(6.0);
-                    ui.weak("滚轮缩放 · 拖空白平移 · 拖节点 · 双击聚焦");
-                });
+                ui.add_space(6.0);
+                if ui.button("退出程序").clicked() {
+                    self.allow_exit = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
     }
 
@@ -575,67 +1024,98 @@ impl App {
 
     // ------------------------------------------------------------ 右侧详情
 
-    fn detail_panel(&mut self, ctx: &egui::Context) {
+    /// 选中某个词后弹出的详情卡片，浮在圆内右侧。
+    fn detail_panel(&mut self, ctx: &egui::Context, pal: &Palette) {
         let Some(sel) = self.selected else { return };
         let node_name = self.graph.nodes[sel as usize].name.clone();
         let mut goto: Option<u32> = None;
         let mut focus_it = false;
+        let mut close = false;
 
-        egui::SidePanel::right("detail")
-            .default_width(240.0)
+        let inner = self.inner_square(ctx);
+        let w = 230.0_f32.min(inner.width() * 0.42);
+        let card = Rect::from_min_size(
+            Pos2::new(inner.right() - w, inner.top()),
+            egui::vec2(w, inner.height()),
+        );
+
+        egui::Area::new(egui::Id::new("detail"))
+            .fixed_pos(card.min)
+            .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.heading(&node_name);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").clicked() {
-                            goto = None;
-                            self.selected = None;
-                        }
-                    });
-                });
+                ui.set_max_width(card.width());
+                egui::Frame::NONE
+                    .fill(pal.card)
+                    .stroke(Stroke::new(1.0, pal.window_border))
+                    .corner_radius(16)
+                    .inner_margin(egui::Margin::symmetric(14, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(card.width() - 28.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&node_name)
+                                    .size(17.0)
+                                    .strong()
+                                    .color(pal.text_strong),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("×").clicked() {
+                                        close = true;
+                                    }
+                                },
+                            );
+                        });
 
-                let node = &self.graph.nodes[sel as usize];
-                ui.weak(
-                    node.weeks
-                        .iter()
-                        .filter_map(|&w| self.graph.weeks.get(w as usize))
-                        .map(|w| w.label())
-                        .collect::<Vec<_>>()
-                        .join("  "),
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("以此为中心").clicked() {
-                        focus_it = true;
-                    }
-                    if ui.button("打开 md").clicked() {
-                        open_path(&node.path);
-                    }
-                });
-                ui.separator();
-                ui.label(RichText::new(format!("联系 ({})", node.degree())).strong());
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut names: Vec<(u32, &str)> = node
-                        .neighbors
-                        .iter()
-                        .map(|&n| (n, self.graph.nodes[n as usize].name.as_str()))
-                        .collect();
-                    names.sort_by_key(|(_, n)| n.to_lowercase());
-                    for (id, name) in names {
-                        let in_view = self.sim.local.contains_key(&id);
-                        let text = if in_view {
-                            RichText::new(name)
-                        } else {
-                            RichText::new(name).weak()
-                        };
-                        if ui.selectable_label(false, text).clicked() {
-                            goto = Some(id);
-                        }
-                    }
-                });
+                        let node = &self.graph.nodes[sel as usize];
+                        ui.weak(
+                            node.weeks
+                                .iter()
+                                .filter_map(|&w| self.graph.weeks.get(w as usize))
+                                .map(|w| w.label())
+                                .collect::<Vec<_>>()
+                                .join("  "),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("以此为中心").clicked() {
+                                focus_it = true;
+                            }
+                            if ui.button("打开 md").clicked() {
+                                open_path(&node.path);
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(format!("联系 ({})", node.degree())).strong());
+                        egui::ScrollArea::vertical()
+                            .max_height(card.height() - 150.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                let mut names: Vec<(u32, &str)> = node
+                                    .neighbors
+                                    .iter()
+                                    .map(|&n| (n, self.graph.nodes[n as usize].name.as_str()))
+                                    .collect();
+                                names.sort_by_key(|(_, n)| n.to_lowercase());
+                                for (id, name) in names {
+                                    let in_view = self.sim.local.contains_key(&id);
+                                    let text = if in_view {
+                                        RichText::new(name)
+                                    } else {
+                                        RichText::new(name).weak()
+                                    };
+                                    if ui.selectable_label(false, text).clicked() {
+                                        goto = Some(id);
+                                    }
+                                }
+                            });
+                    });
             });
 
+        if close {
+            self.selected = None;
+        }
         if focus_it {
             self.focus = Some(sel);
             self.rebuild();
@@ -651,65 +1131,14 @@ impl App {
 
     // -------------------------------------------------------------- 图画布
 
-    /// 画布底：中性深灰的竖向渐变 + 极淡的网格。刻意不带蓝，
-    /// 让节点的彩色是画面里唯一的颜色。
-    fn paint_background(&self, painter: &egui::Painter, rect: Rect, center: Pos2, pal: &Palette) {
-        let top = pal.bg_top;
-        let bottom = pal.bg_bottom;
-        let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(rect.left_top(), top);
-        mesh.colored_vertex(rect.right_top(), top);
-        mesh.colored_vertex(rect.right_bottom(), bottom);
-        mesh.colored_vertex(rect.left_bottom(), bottom);
-        mesh.add_triangle(0, 1, 2);
-        mesh.add_triangle(0, 2, 3);
-        painter.add(Shape::mesh(mesh));
-
-        // 底纹：三角点阵。行间错开半格，看上去是斜向排列的点，
-        // 没有方格那种硬邦邦的横平竖直；越靠画面边缘越淡，自带一圈暗角。
-        let spacing = 78.0 * self.zoom;
-        if spacing > 13.0 && spacing < 420.0 {
-            let row_h = spacing * 0.866; // 正三角形的行高
-            let origin = self.to_screen(center, Pos2::ZERO);
-            let j0 = ((rect.top() - origin.y) / row_h).floor() as i64;
-            let j1 = ((rect.bottom() - origin.y) / row_h).ceil() as i64;
-            let i0 = ((rect.left() - origin.x - spacing) / spacing).floor() as i64;
-            let i1 = ((rect.right() - origin.x) / spacing).ceil() as i64;
-
-            // 点太多就不画了，缩得很远时底纹本来也没意义
-            if (j1 - j0 + 1) * (i1 - i0 + 1) <= 8000 {
-                let max_d = rect.size().length() * 0.5;
-                // 缩放到临界值附近时整体淡出，避免突然出现/消失
-                let scale_fade = ((spacing - 13.0) / 25.0).clamp(0.0, 1.0);
-                let mut dots: Vec<Shape> = Vec::new();
-                for j in j0..=j1 {
-                    let y = origin.y + j as f32 * row_h;
-                    let stagger = if j.rem_euclid(2) == 0 { 0.0 } else { spacing * 0.5 };
-                    for i in i0..=i1 {
-                        let p = Pos2::new(origin.x + stagger + i as f32 * spacing, y);
-                        let t = 1.0 - ((p - center).length() / max_d).clamp(0.0, 1.0);
-                        let a = pal.grid_alpha * scale_fade * (0.25 + 0.75 * t * t);
-                        if a < 1.0 {
-                            continue;
-                        }
-                        dots.push(Shape::circle_filled(
-                            p,
-                            1.4,
-                            pal.grid.gamma_multiply(a / 255.0),
-                        ));
-                    }
-                }
-                painter.extend(dots);
-            }
-        }
-    }
-
     fn graph_view(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
-        let center = rect.center();
+        // 图以「没被卡片挡住的那块」为中心，卡片开合时才不会被压住
+        let content = self.content_rect(ui.ctx());
+        let center = content.center();
 
-        self.paint_background(&painter, rect, center, pal);
+        // 底图已经由 paint_window_frame 铺在整个圆上了，这里不用再画一层
 
         // ---- 物理迭代 ----
         if !self.sim.is_settled() {
@@ -718,16 +1147,81 @@ impl App {
                 self.sim.step();
             }
         } else if self.drifting {
-            // 已经定型：转成气泡漂浮。固定步长，跟帧率无关，才不会忽快忽慢
+            // 已经定型：转成气泡漂浮。用真实帧间隔，掉帧时也不会变慢
             self.sim.drift = self.drift_speed;
-            self.sim.node_scale = self.node_scale;
-            self.sim.drift_step(1.0 / 60.0);
+            let dt = ui.input(|i| i.stable_dt).clamp(1.0 / 120.0, 1.0 / 20.0);
+            self.sim.drift_step(dt);
         }
 
         // 力导向会把图铺得比初始撒点大好几倍，所以在收敛过程中一直跟拍，
         // 否则第一帧对好的视野很快就被甩在外面，画面看上去就是一片空白。
         if self.auto_fit {
-            self.follow_layout(rect);
+            self.follow_layout(content);
+        }
+
+        // ---- 键盘平移 / 缩放 ----
+        // 只有真的在输入框里打字时才让出方向键 —— 否则光标左右移动会变成平移。
+        // 注意不能用 `memory().focused()`：随便点过一个按钮或滑块之后它就一直
+        // 是 Some，方向键和缩放会被整个屏蔽掉。`wants_keyboard_input()` 才是
+        // 「当前有文本框在收键盘」的意思。
+        let typing = ui.ctx().wants_keyboard_input();
+        if !typing {
+            // 长按取 key_down（连续），单击取 key_pressed（离散一步）。
+            // 只用 key_down 的话，快速点一下有可能整个落在两帧之间，
+            // 采样时已经抬起来了 —— 表现就是「按了没反应」。
+            let (dir, step, zoom_hold, zoom_step, fast, dt) = ui.input(|i| {
+                let axis = |neg, pos| {
+                    (i.key_down(pos) as i32 - i.key_down(neg) as i32) as f32
+                };
+                let axis_step = |neg, pos| {
+                    (i.key_pressed(pos) as i32 - i.key_pressed(neg) as i32) as f32
+                };
+                use egui::Key::*;
+                // 拉近：= 和 +（同一个键，按不按 Shift 都认）
+                let zin_down = i.key_down(Equals) || i.key_down(Plus);
+                let zin_step = i.key_pressed(Equals) || i.key_pressed(Plus);
+                (
+                    Vec2::new(axis(ArrowLeft, ArrowRight), axis(ArrowUp, ArrowDown)),
+                    Vec2::new(
+                        axis_step(ArrowLeft, ArrowRight),
+                        axis_step(ArrowUp, ArrowDown),
+                    ),
+                    zin_down as i32 as f32 - i.key_down(Minus) as i32 as f32,
+                    zin_step as i32 as f32 - i.key_pressed(Minus) as i32 as f32,
+                    i.modifiers.shift,
+                    i.stable_dt.clamp(1.0 / 120.0, 1.0 / 20.0),
+                )
+            });
+
+            // 按屏幕速度算再换算回世界坐标，缩放到多大手感都一样
+            let speed = if fast { 1600.0 } else { 700.0 };
+            let mut moved = false;
+            if dir != Vec2::ZERO {
+                self.cam += dir.normalized() * (speed * dt / self.zoom);
+                moved = true;
+            }
+            if step != Vec2::ZERO {
+                self.cam += step.normalized() * (60.0 / self.zoom);
+                moved = true;
+            }
+            // 指数缩放：每一步都是「乘」而不是「加」，
+            // 不然放到很大之后再按一下几乎看不出变化
+            let rate = if fast { 2.6 } else { 1.4 };
+            let mut factor = 0.0;
+            if zoom_hold != 0.0 {
+                factor += zoom_hold * rate * dt;
+            }
+            if zoom_step != 0.0 {
+                factor += zoom_step * 0.15;
+            }
+            if factor != 0.0 {
+                self.zoom = (self.zoom * factor.exp()).clamp(0.02, 20.0);
+                moved = true;
+            }
+            if moved {
+                self.auto_fit = false;
+                ui.ctx().request_repaint();
+            }
         }
 
         // ---- 缩放 / 平移 ----
@@ -744,18 +1238,18 @@ impl App {
             }
         }
 
-        // ---- 命中测试 ----
+        // ---- 命中测试：节点是矩形胶囊，按包围盒判 ----
         let mut hover: Option<usize> = None;
         if let Some(p) = pointer {
             if rect.contains(p) {
                 let world = self.to_world(center, p);
-                let mut best = f32::INFINITY;
                 for i in 0..self.sim.len() {
-                    let r = (self.radius(i) + 4.0 / self.zoom).max(6.0 / self.zoom);
-                    let d = (self.sim.pos[i] - world).length();
-                    if d < r && d < best {
-                        best = d;
+                    let e = self.sim.extent(i);
+                    let c = self.sim.pos[i] + Vec2::new(0.0, e.off_y);
+                    let d = world - c;
+                    if d.x.abs() <= e.half.x && d.y.abs() <= e.half.y {
                         hover = Some(i);
+                        break;
                     }
                 }
             }
@@ -796,50 +1290,42 @@ impl App {
             }
         }
 
-        // 快捷键
-        ui.input(|i| {
-            if i.key_pressed(egui::Key::F) {
-                self.auto_fit = true;
-            }
-            if i.key_pressed(egui::Key::Escape) {
-                self.selected = None;
-            }
-        });
+        // 快捷键。带修饰键的组合和 Esc 都归上层处理，这里只认光秃秃的 F
+        let fit = ui.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::F));
+        if fit {
+            self.auto_fit = true;
+        }
 
         if self.sim.len() == 0 {
             painter.text(
                 center,
                 Align2::CENTER_CENTER,
-                "这个时间范围内没有单词，试试把滑块拉宽一些",
-                FontId::proportional(16.0),
-                pal.status,
+                "这个时间范围内没有单词，试试把时间范围拉宽一些",
+                FontId::proportional(15.0),
+                pal.text_weak,
             );
             return;
         }
 
-        // ---- 高亮集合 ----
-        let highlight = self.hovered.or(self.selected);
-        let highlight_local = highlight.and_then(|g| self.sim.local.get(&g).copied());
-        let mut near: HashSet<usize> = HashSet::new();
-        if let Some(h) = highlight_local {
-            near.insert(h);
+        // ---- 四种状态：选中 > 悬停 > 邻居 > 无关 ----
+        // 选中优先于悬停，这样点定一个词之后，鼠标扫过别处也不会打断阅读
+        let focus_node = self.selected.or(self.hovered);
+        let focus_local = focus_node.and_then(|g| self.sim.local.get(&g).copied());
+        let mut related: HashSet<usize> = HashSet::new();
+        if let Some(h) = focus_local {
+            related.insert(h);
             for &nb in &self.graph.nodes[self.sim.ids[h] as usize].neighbors {
                 if let Some(&l) = self.sim.local.get(&nb) {
-                    near.insert(l);
+                    related.insert(l);
                 }
             }
         }
-        let dim = highlight_local.is_some();
-
+        let emphasis = focus_local.is_some();
         let query = self.search.trim().to_lowercase();
 
-        // ---- 画边 ----
-        let mut shapes: Vec<Shape> = Vec::with_capacity(self.sim.edges.len() + self.sim.len());
-        let base_edge =
-            Color32::from_rgba_unmultiplied(pal.edge[0], pal.edge[1], pal.edge[2], self.edge_alpha);
-        let dim_edge =
-            Color32::from_rgba_unmultiplied(pal.edge[0], pal.edge[1], pal.edge[2], self.edge_alpha / 3);
-        let hot_edge = pal.edge_hot;
+        // ---- 画边（先画，节点会盖住端点，看起来就是连到胶囊边上）----
+        let mut shapes: Vec<Shape> = Vec::with_capacity(self.sim.edges.len());
+        let base_edge = pal.edge_base.gamma_multiply(self.edge_alpha as f32 / 100.0);
         for &(a, b) in &self.sim.edges {
             let (a, b) = (a as usize, b as usize);
             let pa = self.to_screen(center, self.sim.pos[a]);
@@ -847,132 +1333,155 @@ impl App {
             if !segment_visible(rect, pa, pb) {
                 continue;
             }
-            let hot = highlight_local.is_some_and(|h| h == a || h == b);
-            let (color, w) = if hot {
-                (hot_edge, 1.8)
-            } else if dim {
-                (dim_edge, 1.0)
+            let hot = focus_local.is_some_and(|h| h == a || h == b);
+            let (color, width) = if hot {
+                (pal.accent, 2.0)
+            } else if emphasis {
+                (pal.edge_mute, 1.0)
             } else {
-                (base_edge, 1.0)
+                (base_edge, 1.5)
             };
-            shapes.push(Shape::line_segment([pa, pb], Stroke::new(w, color)));
+
+            // 轻微的二次贝塞尔：控制点往垂直方向偏一点点，比直线自然，
+            // 幅度只有长度的 8%，不至于弯得夸张
+            let mid = pa + (pb - pa) * 0.5;
+            let perp = Vec2::new(-(pb.y - pa.y), pb.x - pa.x).normalized();
+            let ctrl = mid + perp * ((pb - pa).length() * 0.08);
+            shapes.push(Shape::QuadraticBezier(
+                egui::epaint::QuadraticBezierShape::from_points_stroke(
+                    [pa, ctrl, pb],
+                    false,
+                    Color32::TRANSPARENT,
+                    Stroke::new(width, color),
+                ),
+            ));
         }
         painter.extend(shapes);
 
-        // ---- 画点 ----
-        let mut shapes: Vec<Shape> = Vec::with_capacity(self.sim.len() * 2);
-        let mut labels: Vec<(Pos2, f32, String, Color32)> = Vec::new();
-        let visible_r = rect.expand(40.0);
+        // ---- 画节点：单词本身就是节点 ----
+        let mut shapes: Vec<Shape> = Vec::with_capacity(self.sim.len() * 3);
+        let mut texts: Vec<(Pos2, String, f32, Color32)> = Vec::new();
+        let cull = rect.expand(80.0);
         let mut visible_count = 0usize;
 
         for i in 0..self.sim.len() {
             let sp = self.to_screen(center, self.sim.pos[i]);
-            if !visible_r.contains(sp) {
+            let e = self.sim.extent(i);
+            let size = e.half * 2.0 * self.zoom;
+            let chip = Rect::from_center_size(sp + Vec2::new(0.0, e.off_y * self.zoom), size);
+            if !cull.intersects(chip) {
                 continue;
             }
             visible_count += 1;
+
             let gid = self.sim.ids[i];
-            let r = (self.radius(i) * self.zoom).clamp(2.0, 60.0);
-            let mut color = self.node_color(gid, pal);
-            let is_near = near.contains(&i);
-            if dim && !is_near {
-                color = fade(color, pal.fade_to, 0.78);
+            let node = &self.graph.nodes[gid as usize];
+            let selected = Some(gid) == self.selected;
+            let hovered = Some(gid) == self.hovered;
+            let is_related = related.contains(&i);
+
+            // 透明度 = 时间远近；无关节点再整体压暗
+            let mut alpha = self.recency_alpha(gid);
+            if emphasis && !is_related {
+                alpha *= 1.0 - pal.dim;
             }
 
-            shapes.push(Shape::circle_filled(sp, r, color));
+            let hue = pal.cluster(node.component);
+            let top = mix(hue, pal.chip_base, pal.chip_top_mix);
+            let bottom = mix(hue, pal.chip_base, pal.chip_bottom_mix);
+            let border = mix(hue, pal.chip_base, pal.chip_border_mix);
 
-            // 选中 / 搜索命中的描边
-            let name_lc = self.graph.nodes[gid as usize].name.to_lowercase();
-            if Some(gid) == self.selected {
-                shapes.push(Shape::circle_stroke(
-                    sp,
-                    r + 3.0,
-                    Stroke::new(2.0, pal.ring_selected),
-                ));
-            } else if !query.is_empty() && name_lc.contains(&query) {
-                shapes.push(Shape::circle_stroke(
-                    sp,
-                    r + 3.0,
-                    Stroke::new(2.0, pal.ring_search),
-                ));
-            } else if Some(gid) == self.hovered {
-                shapes.push(Shape::circle_stroke(
-                    sp,
-                    r + 3.0,
-                    Stroke::new(1.5, pal.ring_hover),
-                ));
+            // 选中的外发光：几层向外扩散的圆角矩形
+            if selected {
+                for k in 1..=3 {
+                    let grow = 3.0 * k as f32;
+                    shapes.push(Shape::Path(egui::epaint::PathShape::convex_polygon(
+                        pill_points(chip.expand(grow), chip.height() * 0.5 + grow),
+                        hue.gamma_multiply(0.13 / k as f32),
+                        Stroke::NONE,
+                    )));
+                }
             }
 
-            if self.show_labels {
-                let text_color = if dim && !is_near {
-                    pal.label_dim
-                } else {
-                    pal.label
-                };
-                labels.push((
-                    sp + Vec2::new(0.0, r + 2.0),
-                    r,
-                    self.graph.nodes[gid as usize].name.clone(),
-                    text_color,
+            gradient_pill(
+                &mut shapes,
+                chip,
+                top.gamma_multiply(alpha),
+                bottom.gamma_multiply(alpha),
+            );
+
+            let (stroke_c, stroke_w) = if selected {
+                (mix(hue, pal.text_strong, 0.25), 2.2)
+            } else if hovered {
+                (border, 1.8)
+            } else if !query.is_empty() && node.name.to_lowercase().contains(&query) {
+                (pal.accent, 2.0)
+            } else {
+                (border.gamma_multiply(alpha), 1.0)
+            };
+            shapes.push(Shape::closed_line(
+                pill_points(chip, chip.height() * 0.5),
+                Stroke::new(stroke_w, stroke_c),
+            ));
+
+            // 字太小就不画了，但走的是渐隐而不是突然消失 —— 之前节点闪烁就是
+            // 因为按「装得下就画」的硬阈值取舍，位置一动结论就翻转
+            let font_px = self.node_font(self.sim.degree[i] as usize) * self.zoom;
+            let text_fade = ((font_px - 4.5) / 3.5).clamp(0.0, 1.0);
+            if text_fade > 0.01 {
+                texts.push((
+                    chip.center(),
+                    node.name.clone(),
+                    font_px,
+                    pal.text_strong.gamma_multiply(alpha * text_fade),
                 ));
             }
         }
         painter.extend(shapes);
 
-        // 标签：大节点优先，已经被占掉的位置就不再画，避免单词叠在一起看不清
-        if self.show_labels {
-            labels.sort_by(|a, b| b.1.total_cmp(&a.1));
-            labels.truncate(self.label_limit);
-            let font = FontId::proportional((12.0 * self.zoom.clamp(0.8, 1.4)).clamp(11.0, 16.0));
-            let mut taken: Vec<Rect> = Vec::with_capacity(labels.len());
-            for (pos, _, text, color) in labels {
-                let galley = painter.layout_no_wrap(text, font.clone(), color);
-                let area = Rect::from_min_size(
-                    pos - Vec2::new(galley.size().x * 0.5, 0.0),
-                    galley.size(),
-                )
-                .expand2(Vec2::new(2.0, 1.0));
-                if taken.iter().any(|t| t.intersects(area)) {
-                    continue;
-                }
-                taken.push(area);
-                painter.galley(area.min + Vec2::new(2.0, 1.0), galley, color);
-            }
+        for (pos, text, font, color) in texts {
+            painter.text(
+                pos,
+                Align2::CENTER_CENTER,
+                text,
+                FontId::proportional(font),
+                color,
+            );
         }
 
         // ---- 悬停提示 ----
-        if let Some(h) = highlight_local {
-            if self.hovered.is_some() {
-                let node = &self.graph.nodes[self.sim.ids[h] as usize];
-                let weeks = node
-                    .weeks
-                    .iter()
-                    .filter_map(|&w| self.graph.weeks.get(w as usize))
-                    .map(|w| w.label())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let tip = format!("{}\n{} 条联系\n{}", node.name, node.degree(), weeks);
-                let anchor = self.to_screen(center, self.sim.pos[h]) + Vec2::new(14.0, 14.0);
-                let galley = painter.layout_no_wrap(tip, FontId::proportional(12.0), pal.tip_text);
-                let bg = Rect::from_min_size(anchor, galley.size()).expand(6.0);
-                painter.rect(
-                    bg,
-                    4.0,
-                    pal.tip_bg,
-                    Stroke::new(1.0, pal.tip_border),
-                    StrokeKind::Inside,
-                );
-                painter.galley(anchor, galley, pal.tip_text);
-            }
+        if let Some(h) = self.hovered.and_then(|g| self.sim.local.get(&g).copied()) {
+            let node = &self.graph.nodes[self.sim.ids[h] as usize];
+            let weeks = node
+                .weeks
+                .iter()
+                .filter_map(|&w| self.graph.weeks.get(w as usize))
+                .map(|w| w.label())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let tip = format!("{} 条联系\n{}", node.degree(), weeks);
+            let e = self.sim.extent(h);
+            let anchor = self.to_screen(center, self.sim.pos[h])
+                + Vec2::new(e.half.x * self.zoom + 10.0, 8.0);
+            let galley = painter.layout_no_wrap(tip, FontId::proportional(12.0), pal.text_weak);
+            let bg = Rect::from_min_size(anchor, galley.size()).expand(7.0);
+            painter.rect(
+                bg,
+                6.0,
+                pal.tip_bg,
+                Stroke::new(1.0, pal.tip_border),
+                StrokeKind::Inside,
+            );
+            painter.galley(anchor, galley, pal.text_weak);
         }
 
         // ---- 左下角状态 ----
         painter.text(
-            rect.left_bottom() + Vec2::new(10.0, -10.0),
+            content.left_bottom() + Vec2::new(4.0, -2.0),
             Align2::LEFT_BOTTOM,
             format!("视野内 {visible_count} / {} 个词", self.sim.len()),
             FontId::proportional(11.0),
-            pal.status,
+            pal.text_weak.gamma_multiply(0.7),
         );
     }
 }
@@ -986,29 +1495,132 @@ fn segment_visible(rect: Rect, a: Pos2, b: Pos2) -> bool {
 
 /// 把颜色往背景色混，`t` 越大越接近背景。暗底往黑混、亮底往白混，
 /// 直接乘系数在亮背景上会越淡越黑，反而更扎眼。
-fn fade(c: Color32, toward: Color32, t: f32) -> Color32 {
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
-    Color32::from_rgb(
-        mix(c.r(), toward.r()),
-        mix(c.g(), toward.g()),
-        mix(c.b(), toward.b()),
-    )
+/// 在两个颜色之间线性插值，`t=0` 取 a，`t=1` 取 b。
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
-fn hsv(h: f32, s: f32, v: f32) -> Color32 {
-    let h = (h.fract() + 1.0).fract() * 6.0;
-    let i = h.floor() as i32;
-    let f = h - i as f32;
-    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
-    let (r, g, b) = match i % 6 {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
+/// 圆角矩形的轮廓点，顺时针。四个角各用几段折线逼近。
+fn pill_points(rect: Rect, radius: f32) -> Vec<Pos2> {
+    round_rect_points(rect, [radius; 4])
+}
+
+/// 四个角半径可以不一样。顺序是 [左上, 右上, 右下, 左下] ——
+/// 侧栏贴着窗口左边，只有左边两个角要跟着窗口圆，右边得是直角。
+fn round_rect_points(rect: Rect, radii: [f32; 4]) -> Vec<Pos2> {
+    let cap = rect.width().min(rect.height()) * 0.5;
+    let [tl, tr, br, bl] = radii.map(|r| r.clamp(0.0, cap.max(0.0)));
+    const SEG: usize = 6;
+    // (圆心, 起始角)：从右下角开始顺时针走
+    let corners = [
+        (Pos2::new(rect.right() - br, rect.bottom() - br), 0.0f32, br),
+        (Pos2::new(rect.left() + bl, rect.bottom() - bl), 90.0, bl),
+        (Pos2::new(rect.left() + tl, rect.top() + tl), 180.0, tl),
+        (Pos2::new(rect.right() - tr, rect.top() + tr), 270.0, tr),
+    ];
+    let mut pts = Vec::with_capacity(4 * (SEG + 1));
+    for (c, a0, r) in corners {
+        for k in 0..=SEG {
+            let a = (a0 + 90.0 * k as f32 / SEG as f32).to_radians();
+            pts.push(Pos2::new(c.x + r * a.cos(), c.y + r * a.sin()));
+        }
+    }
+    pts
+}
+
+/// 画一颗带竖向渐变的胶囊。
+///
+/// egui 的 `rect_filled` 只能填纯色，所以这里自己拼网格：从中心扇形展开到
+/// 圆角轮廓，每个顶点的颜色按它的 y 在上下两色之间插值，就得到了平滑的渐变。
+fn gradient_pill(shapes: &mut Vec<Shape>, rect: Rect, top: Color32, bottom: Color32) {
+    gradient_pill_radius(shapes, rect, rect.height() * 0.5, top, bottom);
+}
+
+fn gradient_pill_radius(
+    shapes: &mut Vec<Shape>,
+    rect: Rect,
+    radius: f32,
+    top: Color32,
+    bottom: Color32,
+) {
+    let pts = pill_points(rect, radius);
+    if pts.is_empty() {
+        return;
+    }
+    let height = rect.height().max(0.001);
+    let color_at = |y: f32| mix(top, bottom, ((y - rect.top()) / height).clamp(0.0, 1.0));
+
+    let mut mesh = egui::Mesh::default();
+    let c = rect.center();
+    // 顶点色只带 rgb，alpha 要单独续上，否则渐变会把透明度抹掉
+    let alpha = top.a().max(bottom.a());
+    let tint = |col: Color32| {
+        Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), alpha)
     };
-    Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+    mesh.colored_vertex(c, tint(color_at(c.y)));
+    for p in &pts {
+        mesh.colored_vertex(*p, tint(color_at(p.y)));
+    }
+    let n = pts.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    shapes.push(Shape::mesh(mesh));
+}
+
+/// 把一张纹理画成圆角矩形。
+///
+/// egui 的 `Painter::image` 只能画方角，而画布是嵌在圆角窗口里的一张内卡片，
+/// 所以这里自己拼网格：从中心扇形展开到圆角轮廓，每个顶点的 uv 按它在矩形里
+/// 的相对位置算出来。
+fn textured_round_rect(
+    rect: Rect,
+    radii: [f32; 4],
+    tex: egui::TextureId,
+    tint: Color32,
+) -> Shape {
+    textured_fan(rect, &round_rect_points(rect, radii), tex, tint)
+}
+
+/// 把一张纹理贴到任意凸多边形上：中心扇形展开，uv 按顶点在 `rect` 里的
+/// 相对位置算。圆形窗口和圆角卡片都走这条路。
+fn textured_fan(rect: Rect, pts: &[Pos2], tex: egui::TextureId, tint: Color32) -> Shape {
+    let mut mesh = egui::Mesh::with_texture(tex);
+    let uv = |p: Pos2| {
+        Pos2::new(
+            ((p.x - rect.left()) / rect.width().max(0.001)).clamp(0.0, 1.0),
+            ((p.y - rect.top()) / rect.height().max(0.001)).clamp(0.0, 1.0),
+        )
+    };
+    let mut push = |p: Pos2| {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: p,
+            uv: uv(p),
+            color: tint,
+        });
+    };
+    push(rect.center());
+    for p in pts {
+        push(*p);
+    }
+    let n = pts.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    Shape::mesh(mesh)
+}
+
+/// 背景图直接编进 exe，这样程序拷到哪都能跑，不用带 assets 目录。
+/// 换图的话替换 `assets/` 里的文件再重新编译即可。
+const BKG_BYTES: &[u8] = include_bytes!("../assets/bkg.png");
+const TAB_BKG_BYTES: &[u8] = include_bytes!("../assets/tab_bkg.png");
+
+fn load_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture(name, pixels, egui::TextureOptions::LINEAR))
 }
 
 fn open_path(path: &std::path::Path) {
@@ -1023,6 +1635,18 @@ fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
+#[cfg(test)]
+mod tests {
+    /// 背景图是 include_bytes! 进来的，编译期就在，这里确认它真能解码 ——
+    /// 解码失败会静默退回纯色背景，光看界面分不出是「没解码」还是「太淡」。
+    #[test]
+    fn backdrop_decodes() {
+        const BYTES: &[u8] = include_bytes!("../assets/bkg.png");
+        let img = image::load_from_memory(BYTES).expect("背景图解码失败").to_rgba8();
+        assert_eq!((img.width(), img.height()), (1672, 941));
+    }
+}
+
 fn setup_style(ctx: &egui::Context) {
     install_cjk_font(ctx);
 }
@@ -1035,9 +1659,20 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
     });
     ctx.style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        s.spacing.slider_width = 170.0;
+        // 侧栏只有 272 宽，滑块太长会把后面的文字顶出面板
+        s.spacing.slider_width = 132.0;
         s.visuals.window_corner_radius = 6.into();
-        s.visuals.panel_fill = pal.panel_fill();
+        // 控件跟着窗口一起圆一点，铺在底纹上才不显得生硬
+        for w in [
+            &mut s.visuals.widgets.noninteractive,
+            &mut s.visuals.widgets.inactive,
+            &mut s.visuals.widgets.hovered,
+            &mut s.visuals.widgets.active,
+            &mut s.visuals.widgets.open,
+        ] {
+            w.corner_radius = 6.into();
+        }
+        s.visuals.panel_fill = pal.panel;
         s.visuals.widgets.noninteractive.bg_stroke.color = match theme {
             Theme::Light => Color32::from_gray(205),
             Theme::Dark => Color32::from_gray(48),

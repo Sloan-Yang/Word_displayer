@@ -13,11 +13,15 @@ eframe = { version = "0.31", default-features = false, features = [
 egui = "0.31"
 rayon = "1"
 walkdir = "2"
+# 只用来解码那张背景图
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 # 只为了注册 Ctrl+9 这个全局热键
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

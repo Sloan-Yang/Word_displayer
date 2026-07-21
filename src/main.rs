@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod hotkey;
 mod layout;
 mod vocab;
 
@@ -26,13 +27,17 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([800.0, 560.0])
-            .with_title("Word Displayer — 单词图网"),
+            .with_min_inner_size([760.0, 520.0])
+            // 不要系统标题栏，自己画一个圆角卡片当窗口
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(true)
+            .with_title("LEXIS · Word Atlas"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Word Displayer",
+        "LEXIS · Word Atlas",
         options,
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, root)))),
     )
