@@ -7,7 +7,7 @@ use egui::{
 
 use crate::hotkey;
 use crate::layout::{self, Sim};
-use crate::vocab::Graph;
+use crate::vocab::{Graph, Week};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Theme {
@@ -40,6 +40,49 @@ const WINDOW_RADIUS: f32 = 34.0;
 const DEFAULT_WINDOW: egui::Vec2 = egui::vec2(1440.0, 900.0);
 /// 小于这个尺寸就认为已经没法操作了
 const MIN_WINDOW: egui::Vec2 = egui::vec2(420.0, 320.0);
+/// Windows 的 Win+Shift+方向键跨屏移动会经历几帧过渡态；延后并重试归位。
+const MONITOR_SWITCH_SNAP_FRAMES: u32 = 12;
+
+/// 重新读取词库后，周列表可能因为新增/删除笔记而改变下标。
+/// 按周标签重新定位旧范围，不能直接复用下标，也不能重置成最近四周。
+fn remap_week_range(
+    old_weeks: &[Week],
+    old_lo: usize,
+    old_hi: usize,
+    new_weeks: &[Week],
+) -> (usize, usize) {
+    if new_weeks.is_empty() {
+        return (0, 0);
+    }
+
+    let (Some(&lo), Some(&hi)) = (old_weeks.get(old_lo), old_weeks.get(old_hi)) else {
+        let last = new_weeks.len() - 1;
+        return (last.saturating_sub(3), last);
+    };
+
+    fn nearest(weeks: &[Week], target: Week) -> usize {
+        match weeks.binary_search(&target) {
+            Ok(index) => index,
+            Err(0) => 0,
+            Err(index) if index == weeks.len() => weeks.len() - 1,
+            Err(index) => {
+                let ordinal = |week: Week| i32::from(week.year) * 53 + i32::from(week.week);
+                let target = ordinal(target);
+                let before = (target - ordinal(weeks[index - 1])).abs();
+                let after = (ordinal(weeks[index]) - target).abs();
+                if before <= after {
+                    index - 1
+                } else {
+                    index
+                }
+            }
+        }
+    }
+
+    let lo = nearest(new_weeks, lo);
+    let hi = nearest(new_weeks, hi);
+    (lo.min(hi), lo.max(hi))
+}
 
 /// 画布上所有颜色都从这里取，换主题时不会漏掉某个硬编码的色值。
 struct Palette {
@@ -152,6 +195,12 @@ pub struct App {
     pending_rebuild: bool,
     /// 还剩几帧去尝试摆窗口位置。屏幕尺寸要等 winit 报上来，不是立刻就有的
     place_window: u32,
+    /// 上一次观察到的显示器，用来发现 Win+Shift+方向键这类系统跨屏移动
+    last_monitor: Option<isize>,
+    /// 这次跨屏移动最终要吸附到哪块屏，避免重试时又按过渡位置猜回旧屏
+    monitor_snap_target: Option<isize>,
+    /// 跨屏移动后还剩几帧继续把窗口吸回当前屏幕的顶端居中
+    monitor_snap_frames: u32,
     /// 连续多少帧观测到窗口小得没法用了。跨屏换 DPI 时会瞬间读到异常值，
     /// 必须连续成立一段时间才动手，否则会误伤
     tiny_frames: u32,
@@ -217,6 +266,9 @@ impl App {
             allow_exit: false,
             pending_rebuild: true,
             place_window: 60,
+            last_monitor: None,
+            monitor_snap_target: None,
+            monitor_snap_frames: 0,
             tiny_frames: 0,
             backdrop: None,
             sidebar_backdrop: None,
@@ -377,15 +429,31 @@ impl App {
 
     fn reload(&mut self) {
         let root = PathBuf::from(self.root_input.trim());
+        let old_range = (self.week_lo, self.week_hi);
+        let old_weeks = self.graph.weeks.clone();
+        let focus_name = self
+            .focus
+            .and_then(|id| self.graph.nodes.get(id as usize))
+            .map(|node| node.name.clone());
+        let selected_name = self
+            .selected
+            .and_then(|id| self.graph.nodes.get(id as usize))
+            .map(|node| node.name.clone());
+
         match Graph::load(&root) {
             Ok(g) => {
                 self.graph = g;
                 self.load_error = None;
-                self.focus = None;
-                self.selected = None;
-                let last = self.graph.weeks.len().saturating_sub(1);
-                self.week_hi = last;
-                self.week_lo = last.saturating_sub(3);
+                (self.week_lo, self.week_hi) = remap_week_range(
+                    &old_weeks,
+                    old_range.0,
+                    old_range.1,
+                    &self.graph.weeks,
+                );
+                self.focus = focus_name.and_then(|name| self.graph.find(&name));
+                self.selected = selected_name.and_then(|name| self.graph.find(&name));
+                self.hovered = None;
+                self.dragging = None;
                 self.rebuild();
             }
             Err(e) => self.load_error = Some(e),
@@ -485,6 +553,7 @@ impl eframe::App for App {
         let pal = Palette::of(self.theme);
 
         self.place_window_once(ctx);
+        self.snap_after_monitor_switch();
 
         if self.pending_rebuild {
             self.pending_rebuild = false;
@@ -504,10 +573,15 @@ impl eframe::App for App {
             self.focus_search = true;
         }
 
-        // Ctrl+0 把窗口重新摆回「当前所在这块屏幕的顶端居中」。
+        // F5 重新读取笔记库并重建节点/连线。笔记文件改动后用这个刷新视图。
+        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            self.reload();
+        }
+
+        // Ctrl+N 把窗口重新摆回「当前所在这块屏幕的顶端居中」。
         // 多屏之间来回拖之后位置乱了，用这个一键归位。
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Num0)) {
-            self.place_window = 60;
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
+            hotkey::snap_top_center();
         }
 
         // F11 全屏。放在这里而不是画布里，是因为焦点在卡片上时画布收不到按键
@@ -540,7 +614,11 @@ impl eframe::App for App {
         }
         self.detail_panel(ctx, &pal);
 
-        if !self.sim.is_settled() || self.auto_fit || self.drifting {
+        if !self.sim.is_settled()
+            || self.auto_fit
+            || self.drifting
+            || self.monitor_snap_frames > 0
+        {
             // 排一个定时重绘而不是「立刻」，否则会以显卡能跑多快就跑多快的
             // 速度空转。气泡本来就飘得慢，30fps 完全够看，而且省一半电。
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -556,36 +634,54 @@ impl App {
     }
 
     /// 把窗口摆到「当前所在这块屏幕的顶端、水平居中」。启动时跑一次，
-    /// 之后可以用 Ctrl+0 手动再来一次。
+    /// 之后可以用 Ctrl+N 手动再来一次。
     ///
-    /// 不能在 `ViewportBuilder` 里写死坐标 —— 那时候还不知道屏幕多大。
-    /// 屏幕尺寸要等 winit 报上来，前几帧可能都是 None，所以这里重试几十帧，
-    /// 摆成功或者次数用完就不再管，免得跟用户抢窗口。
-    fn place_window_once(&mut self, ctx: &egui::Context) {
+    /// 前几帧窗口可能还没建出来，所以是重试若干帧；成功或次数用完就收手，
+    /// 不能一直摆，否则用户自己拖走的窗口会被拽回来。
+    fn place_window_once(&mut self, _ctx: &egui::Context) {
         if self.place_window == 0 {
             return;
         }
         self.place_window -= 1;
+        // 开头十几帧窗口的尺寸还没定下来，这时候摆会按错误的宽度算居中，
+        // 结果就是贴在屏幕左边。等它稳定了再摆，并且过一会儿再补一次，
+        // 防止第一次仍然赶在 DPI 适配之前。
+        if matches!(self.place_window, 45 | 18) {
+            hotkey::snap_top_center();
+        }
+        if self.place_window < 18 {
+            self.place_window = 0;
+        }
+    }
 
-        let geom = ctx.input(|i| {
-            let v = i.viewport();
-            v.monitor_size
-                .zip(v.outer_rect.map(|r| r.size()))
-        });
-        let Some((monitor, window)) = geom else {
-            return;
-        };
-        if monitor.x <= 1.0 || window.x <= 1.0 {
+    /// Win+Shift+方向键由系统直接搬窗口，应用收不到普通按键事件。
+    /// 所以这里看窗口所在显示器是否变化；变化后等系统搬完，再把它吸到目标屏顶部居中。
+    fn snap_after_monitor_switch(&mut self) {
+        if self.monitor_snap_frames > 0 {
+            self.monitor_snap_frames -= 1;
+
+            // 先让 Windows 完成跨屏移动；随后多补两次，避开不同 DPI 屏幕间的过渡尺寸。
+            if matches!(self.monitor_snap_frames, 8 | 4 | 0) {
+                if hotkey::snap_top_center_on(self.monitor_snap_target) {
+                    self.last_monitor = self
+                        .monitor_snap_target
+                        .or_else(|| hotkey::current_monitor_id());
+                    if self.monitor_snap_frames == 0 {
+                        self.monitor_snap_target = None;
+                    }
+                }
+            }
             return;
         }
-        // outer_rect 是屏幕绝对坐标，多屏时要先找出窗口现在在哪块屏上，
-        // 再在那块屏的范围内居中 —— 直接用 (0, monitor) 会把窗口甩回主屏
-        let origin = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(Pos2::ZERO);
-        let screen_index = (origin.x / monitor.x).floor();
-        let left = screen_index * monitor.x;
-        let x = left + ((monitor.x - window.x) * 0.5).max(0.0);
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(x, 0.0)));
-        self.place_window = 0;
+
+        let current = hotkey::current_monitor_id_away_from(self.last_monitor);
+        if current != self.last_monitor {
+            if self.last_monitor.is_some() && current.is_some() {
+                self.monitor_snap_target = current;
+                self.monitor_snap_frames = MONITOR_SWITCH_SNAP_FRAMES;
+            }
+            self.last_monitor = current;
+        }
     }
 
     fn is_fullscreen(&self, ctx: &egui::Context) -> bool {
@@ -671,9 +767,15 @@ impl App {
         // 会在跨屏时把窗口莫名其妙地重置掉。
         if screen.width() < MIN_WINDOW.x || screen.height() < MIN_WINDOW.y {
             self.tiny_frames += 1;
-            if self.tiny_frames > 45 {
+            if self.tiny_frames > 30 {
                 self.tiny_frames = 0;
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(DEFAULT_WINDOW));
+                // 用物理像素直接找系统要，不走 eframe —— 窗口塌下去之后
+                // ViewportCommand::InnerSize 实测是不生效的
+                let ppp = ctx.pixels_per_point();
+                hotkey::restore_size(
+                    (DEFAULT_WINDOW.x * ppp) as i32,
+                    (DEFAULT_WINDOW.y * ppp) as i32,
+                );
             }
             return;
         }
@@ -813,9 +915,10 @@ impl App {
                         } else {
                             ui.weak("Ctrl+9 被占用，只在窗口内生效");
                         }
-                        ui.weak("Ctrl+F 搜索 · Esc 关详情 · F 复位视野 · F11 全屏");
-                        ui.weak("方向键平移 · +/− 缩放 · 按住 Shift 加速");
-                        ui.weak("Ctrl+0 窗口归位（多屏拖乱了用它）");
+                        ui.weak("Ctrl+F 搜索 · F5 刷新词库 · Esc 关详情");
+                        ui.weak("F 复位视野 · F11 全屏 · 方向键平移");
+                        ui.weak("+/− 缩放 · 按住 Shift 加速");
+                        ui.weak("Ctrl+N 窗口归位（多屏拖乱了用它）");
                         ui.weak("拖本卡空白处可移动窗口");
 
                         if let Some(tex) = &self.sidebar_backdrop {
@@ -962,7 +1065,7 @@ impl App {
                     egui::TextEdit::singleline(&mut self.root_input)
                         .desired_width(f32::INFINITY),
                 );
-                if ui.button("重新加载").clicked() {
+                if ui.button("重新加载（F5）").clicked() {
                     self.reload();
                 }
 
@@ -985,6 +1088,11 @@ impl App {
                 ));
                 if self.graph.dangling_links > 0 {
                     ui.weak(format!("{} 个链接指向不存在的词", self.graph.dangling_links));
+                }
+
+                ui.add_space(6.0);
+                if ui.button("窗口归位（顶端居中）").clicked() {
+                    hotkey::snap_top_center();
                 }
 
                 ui.add_space(6.0);
@@ -1637,6 +1745,36 @@ fn open_path(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    use super::remap_week_range;
+    use crate::vocab::Week;
+
+    fn week(year: u16, week: u8) -> Week {
+        Week { year, week }
+    }
+
+    #[test]
+    fn reload_preserves_selected_week_labels() {
+        let old = [week(2026, 2), week(2026, 3), week(2026, 4), week(2026, 5)];
+        let new = [
+            week(2026, 1),
+            week(2026, 2),
+            week(2026, 3),
+            week(2026, 4),
+            week(2026, 5),
+            week(2026, 6),
+        ];
+
+        assert_eq!(remap_week_range(&old, 1, 2, &new), (2, 3));
+    }
+
+    #[test]
+    fn reload_uses_nearest_weeks_when_old_boundaries_were_removed() {
+        let old = [week(2026, 2), week(2026, 3), week(2026, 4), week(2026, 5)];
+        let new = [week(2026, 1), week(2026, 2), week(2026, 5), week(2026, 6)];
+
+        assert_eq!(remap_week_range(&old, 1, 2, &new), (1, 2));
+    }
+
     /// 背景图是 include_bytes! 进来的，编译期就在，这里确认它真能解码 ——
     /// 解码失败会静默退回纯色背景，光看界面分不出是「没解码」还是「太淡」。
     #[test]
@@ -1648,6 +1786,9 @@ mod tests {
 }
 
 fn setup_style(ctx: &egui::Context) {
+    // egui 自带一套「Ctrl +/-/0 缩放整个界面」的快捷键，而且会把这些事件吃掉。
+    // 我们自己有画布缩放和 Ctrl+0 归位，冲突了 —— 关掉它的。
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
     install_cjk_font(ctx);
 }
 
