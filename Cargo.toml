@@ -26,6 +26,26 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# 操作 NSWindow / NSScreen：窗口显隐、顶端居中、多屏定位、救回尺寸。
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSEnumerator",
+    "NSGeometry",
+    "NSString",
+    "NSThread",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSScreen",
+    "NSView",
+    "NSWindow",
+] }
+# 全局热键 Cmd+9 走 Carbon 的 RegisterEventHotKey（无需辅助功能权限），
+# 通过 #[link] 直接链接 Carbon framework，不再单列依赖。
+
 [profile.release]
 opt-level = 3
 lto = "thin"

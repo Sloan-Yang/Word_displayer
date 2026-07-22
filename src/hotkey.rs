@@ -445,7 +445,289 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod imp {
+    //! macOS 版：用 AppKit 操作 NSWindow / NSScreen，全局热键走 Carbon。
+    //!
+    //! 和 Windows 的两大差异：
+    //!
+    //! 1. **点击穿透是白送的**。macOS 对非透明窗口里全透明（alpha=0）的像素
+    //!    会自动把鼠标事件透传给下层窗口，所以圆角外那圈只要画成透明就已经
+    //!    能点穿，不需要像 Windows 那样 `SetWindowRgn`。`apply_window_shape`
+    //!    因此基本是空的。
+    //!
+    //! 2. **不用单开线程等热键**。Carbon 的 `RegisterEventHotKey` 把热键事件
+    //!    投递到主线程的事件派发器上，即便窗口隐藏、winit 事件循环 park 住，
+    //!    run loop 仍会把它派发过来。所以处理器直接在主线程里显隐窗口，
+    //!    AppKit 调用天然安全，不必像 Win32 那样在别的线程调 ShowWindow。
+
+    use std::ffi::c_void;
+    use std::sync::atomic::Ordering;
+
+    use objc2::rc::Retained;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSScreen, NSWindow};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    // ------------------------------------------------------------ 找主窗口
+
+    /// winit 只建一个顶层窗口。全程在主线程访问 AppKit，所以不缓存裸指针，
+    /// 每次按需从 NSApp 里取：优先 key/main 窗口，隐藏时它俩为空就退回第一个。
+    fn main_window(mtm: MainThreadMarker) -> Option<Retained<NSWindow>> {
+        let app = NSApplication::sharedApplication(mtm);
+        app.keyWindow()
+            .or_else(|| app.mainWindow())
+            .or_else(|| app.windows().firstObject())
+    }
+
+    /// 拿到主窗口后在主线程上跑一段逻辑。不在主线程、或还没有窗口时返回 None。
+    fn with_window<R>(f: impl FnOnce(&NSWindow, MainThreadMarker) -> R) -> Option<R> {
+        let mtm = MainThreadMarker::new()?;
+        let win = main_window(mtm)?;
+        Some(f(&win, mtm))
+    }
+
+    // ------------------------------------------------------------ 显示器
+
+    /// 用 NSScreen 对象的地址当作显示器 id。同一会话里 AppKit 复用同一批
+    /// NSScreen 实例，指针稳定，够用来判断「窗口是不是换了块屏」。
+    fn screen_id(screen: &NSScreen) -> isize {
+        (screen as *const NSScreen) as isize
+    }
+
+    fn find_screen(id: isize, mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
+        let screens = NSScreen::screens(mtm);
+        (0..screens.count())
+            .map(|i| screens.objectAtIndex(i))
+            .find(|s| screen_id(s) == id)
+    }
+
+    /// 把窗口摆到给定屏幕的可视区（避开菜单栏和 Dock）顶端、水平居中。
+    ///
+    /// macOS 坐标原点在左下角、y 向上，所以「顶边」是 `origin.y + height`，
+    /// 窗口原点要减去自身高度才能让上沿贴着可视区顶部。
+    fn place_top_center(w: &NSWindow, screen: Option<Retained<NSScreen>>) -> bool {
+        let Some(screen) = screen else {
+            return false;
+        };
+        let vis = screen.visibleFrame();
+        let frame = w.frame();
+        let x = vis.origin.x + (vis.size.width - frame.size.width) * 0.5;
+        let top = vis.origin.y + vis.size.height;
+        let y = top - frame.size.height;
+        w.setFrameOrigin(NSPoint { x, y });
+        true
+    }
+
+    // ------------------------------------------------------------ 显隐
+
+    pub fn is_visible() -> bool {
+        // 认不出窗口时（启动前几帧）当作可见，别被当成隐藏而不画东西
+        with_window(|w, _| w.isVisible()).unwrap_or(true)
+    }
+
+    pub fn hide() {
+        let _ = with_window(|w, _| w.orderOut(None));
+    }
+
+    #[allow(deprecated)] // activateIgnoringOtherApps 自 macOS 14 起弃用，但仍是把
+    // 后台窗口抢到前台最稳的做法，替代 API 依赖更高的部署目标
+    fn show() {
+        let _ = with_window(|w, mtm| {
+            NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+            if w.isMiniaturized() {
+                w.deminiaturize(None);
+            }
+            w.makeKeyAndOrderFront(None);
+        });
+    }
+
+    // ------------------------------------------------------------ 窗口摆位
+
+    /// macOS 不裁窗口形状：透明像素自动放行点击，圆角外无需额外处理。
+    pub fn apply_window_shape(_radius_px: i32) {}
+
+    pub fn snap_top_center() -> bool {
+        with_window(|w, mtm| place_top_center(w, w.screen().or_else(|| NSScreen::mainScreen(mtm))))
+            .unwrap_or(false)
+    }
+
+    pub fn snap_top_center_on(monitor_id: Option<isize>) -> bool {
+        with_window(|w, mtm| {
+            let screen = monitor_id
+                .and_then(|id| find_screen(id, mtm))
+                .or_else(|| w.screen())
+                .or_else(|| NSScreen::mainScreen(mtm));
+            place_top_center(w, screen)
+        })
+        .unwrap_or(false)
+    }
+
+    pub fn current_monitor_id() -> Option<isize> {
+        with_window(|w, _| w.screen().map(|s| screen_id(&s))).flatten()
+    }
+
+    /// macOS 没有 Win+Shift+方向键那种系统级「甩到另一块屏」，窗口换屏只会是
+    /// 用户手动拖动的结果 —— 那时不该把它再抢回顶端居中，否则会和用户较劲。
+    /// 所以这里从不报告变化：始终沿用上一次的值，让上层的跨屏重排逻辑保持静默；
+    /// 只有首帧 previous 为空时才给出真实所在屏，好让上层的 last_monitor 有初值。
+    pub fn current_monitor_id_away_from(previous: Option<isize>) -> Option<isize> {
+        previous.or_else(current_monitor_id)
+    }
+
+    /// 把窗口强行恢复成给定的**物理像素**尺寸，再摆回顶端居中。
+    /// 上层按物理像素传进来（已乘过 DPI），而 AppKit 的 frame 用的是「点」，
+    /// 所以这里要除以 backingScaleFactor 换算回去，否则高 DPI 屏上会大一倍。
+    pub fn restore_size(w_px: i32, h_px: i32) -> bool {
+        with_window(|w, mtm| {
+            let scale = w.backingScaleFactor();
+            let scale = if scale > 0.0 { scale } else { 1.0 };
+            let frame = w.frame();
+            let new = NSRect {
+                origin: frame.origin,
+                size: NSSize {
+                    width: w_px as f64 / scale,
+                    height: h_px as f64 / scale,
+                },
+            };
+            w.setFrame_display(new, true);
+            place_top_center(w, w.screen().or_else(|| NSScreen::mainScreen(mtm)))
+        })
+        .unwrap_or(false)
+    }
+
+    // ------------------------------------------------------------ 全局热键
+
+    /// 传给 C 回调长期持有的一点上下文。泄漏一份，进程活多久它活多久。
+    struct HotkeyCtx {
+        ctx: egui::Context,
+        signal: super::Signal,
+    }
+
+    /// Carbon 在主线程的事件派发里调这个。既然在主线程，显隐窗口直接做即可。
+    unsafe extern "C" fn hotkey_handler(
+        _call: carbon::EventHandlerCallRef,
+        _event: carbon::EventRef,
+        user: *mut c_void,
+    ) -> carbon::OSStatus {
+        let hk = unsafe { &*(user as *const HotkeyCtx) };
+        if is_visible() {
+            hide();
+        } else {
+            show();
+            hk.signal.store(true, Ordering::SeqCst);
+        }
+        // 窗口 park 住时也要把 winit 事件循环叫醒来重绘
+        hk.ctx.request_repaint();
+        0 // noErr
+    }
+
+    pub fn spawn(ctx: egui::Context, signal: super::Signal) -> bool {
+        // Carbon 事件目标和热键都要在主线程（run loop 所在线程）上注册
+        if MainThreadMarker::new().is_none() {
+            return false;
+        }
+        let boxed = Box::into_raw(Box::new(HotkeyCtx { ctx, signal }));
+        // SAFETY: 都是标准 Carbon 调用；boxed 指向的上下文被故意泄漏，
+        // 在整个进程生命周期内有效，回调解引用它是安全的。
+        unsafe {
+            let target = carbon::GetApplicationEventTarget();
+            let spec = carbon::EventTypeSpec {
+                event_class: carbon::K_EVENT_CLASS_KEYBOARD,
+                event_kind: carbon::K_EVENT_HOTKEY_PRESSED,
+            };
+            let mut handler_ref: carbon::EventHandlerRef = std::ptr::null_mut();
+            let installed = carbon::InstallEventHandler(
+                target,
+                Some(hotkey_handler),
+                1,
+                &spec,
+                boxed as *mut c_void,
+                &mut handler_ref,
+            ) == 0;
+            if !installed {
+                drop(Box::from_raw(boxed));
+                return false;
+            }
+
+            // Cmd+9：和窗口内 `modifiers.command + 9` 保持一致（mac 上 command 即 ⌘）。
+            let hotkey_id = carbon::EventHotKeyID {
+                signature: u32::from_be_bytes(*b"watl"),
+                id: 1,
+            };
+            let mut hk_ref: carbon::EventHotKeyRef = std::ptr::null_mut();
+            carbon::RegisterEventHotKey(
+                carbon::KVK_ANSI_9,
+                carbon::CMD_KEY,
+                hotkey_id,
+                target,
+                0,
+                &mut hk_ref,
+            ) == 0
+        }
+    }
+
+    /// Carbon / HIToolbox 里注册全局热键要用到的一小撮 FFI 声明。
+    mod carbon {
+        use std::ffi::c_void;
+
+        pub type OSStatus = i32;
+        pub type OSType = u32;
+        pub type EventTargetRef = *mut c_void;
+        pub type EventHotKeyRef = *mut c_void;
+        pub type EventHandlerRef = *mut c_void;
+        pub type EventHandlerCallRef = *mut c_void;
+        pub type EventRef = *mut c_void;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        pub struct EventHotKeyID {
+            pub signature: OSType,
+            pub id: u32,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        pub struct EventTypeSpec {
+            pub event_class: OSType,
+            pub event_kind: u32,
+        }
+
+        pub type EventHandlerUPP = Option<
+            unsafe extern "C" fn(EventHandlerCallRef, EventRef, *mut c_void) -> OSStatus,
+        >;
+
+        // Events.h 里的修饰键掩码与键码
+        pub const CMD_KEY: u32 = 0x0100;
+        pub const KVK_ANSI_9: u32 = 0x19;
+        // 'keyb' 四字符码；kEventHotKeyPressed = 6
+        pub const K_EVENT_CLASS_KEYBOARD: OSType = u32::from_be_bytes(*b"keyb");
+        pub const K_EVENT_HOTKEY_PRESSED: u32 = 6;
+
+        #[link(name = "Carbon", kind = "framework")]
+        extern "C" {
+            pub fn GetApplicationEventTarget() -> EventTargetRef;
+            pub fn RegisterEventHotKey(
+                in_hot_key_code: u32,
+                in_hot_key_modifiers: u32,
+                in_hot_key_id: EventHotKeyID,
+                in_target: EventTargetRef,
+                in_options: u32,
+                out_ref: *mut EventHotKeyRef,
+            ) -> OSStatus;
+            pub fn InstallEventHandler(
+                in_target: EventTargetRef,
+                in_handler: EventHandlerUPP,
+                in_num_types: usize,
+                in_list: *const EventTypeSpec,
+                in_user_data: *mut c_void,
+                out_ref: *mut EventHandlerRef,
+            ) -> OSStatus;
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod imp {
     pub fn spawn(_ctx: egui::Context, _signal: super::Signal) -> bool {
         false // 其它平台暂时只有窗口内的 Ctrl+9
@@ -454,7 +736,7 @@ mod imp {
         true
     }
     pub fn hide() {}
-    /// 非 Windows 平台暂时不裁窗口形状，圆角只是画出来的
+    /// 其它平台暂时不裁窗口形状，圆角只是画出来的
     pub fn apply_window_shape(_radius_px: i32) {}
     pub fn snap_top_center() -> bool {
         false

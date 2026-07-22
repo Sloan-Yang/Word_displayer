@@ -1830,7 +1830,16 @@ fn install_cjk_font(ctx: &egui::Context) {
         r"C:\Windows\Fonts\simsun.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        // macOS：新系统里 PingFang 已不在这个老路径，读不到就往下退。
+        // 后面几个都是系统自带、ab_glyph 能正常解析的中文字体，黑体优先，
+        // 最后用 Arial Unicode 兜底（含全套 CJK，一定能显示，只是没那么好看）。
         "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
     ];
     for path in CANDIDATES {
         let Ok(bytes) = std::fs::read(path) else { continue };
@@ -1853,4 +1862,5 @@ fn install_cjk_font(ctx: &egui::Context) {
         ctx.set_fonts(fonts);
         return;
     }
+    eprintln!("警告：候选里没有一个中文字体可读，界面中文会显示成方块");
 }

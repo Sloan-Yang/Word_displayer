@@ -1,5 +1,4 @@
+/target
 
-build
-
-release
-deps
+# macOS
+.DS_Store

@@ -8,7 +8,31 @@ mod vocab;
 
 use std::path::PathBuf;
 
-const DEFAULT_ROOT: &str = r"D:\Code\Vocab";
+/// 没有从命令行给目录时，默认去哪儿找词库。
+///
+/// 每个平台把库放在各自习惯的位置：Windows 上是固定盘符，macOS 上放在
+/// 用户主目录下的 WorkSpace/English_words（换用户名也能用，所以拼 HOME
+/// 而不是写死 /Users/xxx）。
+fn default_root() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(r"D:\Code\Vocab")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join("WorkSpace/English_words")
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join("English_words")
+    }
+}
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -16,7 +40,7 @@ fn main() -> eframe::Result<()> {
         .iter()
         .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT));
+        .unwrap_or_else(default_root);
 
     // 不开窗口，只把解析结果打出来，方便确认目录读对了
     if args.iter().any(|a| a == "--stats") {
