@@ -35,6 +35,8 @@ pub struct Node {
     pub path: PathBuf,
     /// 该词出现过的所有周（已排序去重），存的是 `Graph::weeks` 里的下标。
     pub weeks: Vec<u16>,
+    /// 该笔记的标签（除去 modified/*），存的是 `Graph::tags` 里的下标。
+    pub tags: Vec<u16>,
     /// 无向邻居（全局节点下标，已去重）。
     pub neighbors: Vec<u32>,
     /// 连通分量编号，用来给节点上色。
@@ -58,6 +60,8 @@ pub struct Graph {
     pub edges: Vec<(u32, u32)>,
     /// 全库出现过的所有周，升序。节点里的 weeks 存的是这里的下标。
     pub weeks: Vec<Week>,
+    /// 全库出现过的所有标签（除去 modified/*），升序去重。
+    pub tags: Vec<String>,
     /// 小写名字 -> 节点下标，用于解析链接（Obsidian 的链接大小写不敏感）。
     by_name: HashMap<String, u32>,
     /// 指向不存在的 md 的链接数量，用来提示数据里的笔误。
@@ -118,6 +122,17 @@ impl Graph {
             .map(|(i, w)| (*w, i as u16))
             .collect();
 
+        // 4b. 全局标签表
+        let mut all_tags: Vec<String> =
+            parsed.iter().flat_map(|p| p.tags.iter().cloned()).collect();
+        all_tags.sort_unstable();
+        all_tags.dedup();
+        let tag_idx: HashMap<&str, u16> = all_tags
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.as_str(), i as u16))
+            .collect();
+
         // 5. 解析链接 -> 边
         let mut nodes: Vec<Node> = parsed
             .iter()
@@ -125,10 +140,15 @@ impl Graph {
                 let mut weeks: Vec<u16> = p.weeks.iter().filter_map(|w| week_idx.get(w).copied()).collect();
                 weeks.sort_unstable();
                 weeks.dedup();
+                let mut tags: Vec<u16> =
+                    p.tags.iter().filter_map(|t| tag_idx.get(t.as_str()).copied()).collect();
+                tags.sort_unstable();
+                tags.dedup();
                 Node {
                     name: p.name.clone(),
                     path: p.path.clone(),
                     weeks,
+                    tags,
                     neighbors: Vec::new(),
                     component: 0,
                 }
@@ -162,6 +182,7 @@ impl Graph {
             nodes,
             edges,
             weeks: all_weeks,
+            tags: all_tags,
             by_name,
             dangling_links: dangling,
         };
@@ -214,6 +235,7 @@ struct Parsed {
     name: String,
     path: PathBuf,
     weeks: Vec<Week>,
+    tags: Vec<String>,
     links: Vec<String>,
 }
 
@@ -223,6 +245,7 @@ fn parse_one(name: String, path: PathBuf, text: &str) -> Parsed {
         name,
         path,
         weeks: parse_weeks(front),
+        tags: parse_tags(front),
         links: parse_links(body),
     }
 }
@@ -277,6 +300,28 @@ fn parse_weeks(front: &str) -> Vec<Week> {
     out
 }
 
+/// 从 frontmatter 的 tags 列表里抓标签，去掉 `modified/*` 那些时间标签。
+///
+/// 只认块状写法（每行 `  - xxx`）。这库的 frontmatter 里唯一的列表就是 tags
+/// （aliases 是空的 `[]`），所以扫所有 `- item` 行就够了，不必真解析 YAML。
+fn parse_tags(front: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in front.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("- ") else {
+            continue;
+        };
+        let tag = rest.trim().trim_matches(['"', '\'']).trim();
+        if tag.is_empty() || tag.starts_with("modified/") {
+            continue;
+        }
+        out.push(tag.to_string());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// 抓正文里的 `[[target]]` / `[[target|别名]]` / `[[target#小节]]`。
 fn parse_links(body: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -320,5 +365,39 @@ mod tests {
         let p = parse_one("x".into(), PathBuf::new(), "# x\n[[y]]\n");
         assert!(p.weeks.is_empty());
         assert_eq!(p.links, vec!["y".to_string()]);
+    }
+
+    #[test]
+    fn parses_tags_and_drops_modified() {
+        let text = "---\naliases: []\ntags:\n  - academic\n  - modified/2025-W52\n  - Paper\n  - modified/2026-W01\n---\nbody\n";
+        let p = parse_one("Academic".into(), PathBuf::new(), text);
+        // modified/* 不算标签；其余按名字排序去重
+        assert_eq!(p.tags, vec!["Paper".to_string(), "academic".to_string()]);
+        assert_eq!(p.weeks.len(), 2);
+    }
+
+    #[test]
+    fn tag_index_attaches_to_the_right_note() {
+        let dir = std::env::temp_dir().join(format!("wd_tagtest_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("A.md"),
+            "---\ntags:\n  - academic\n  - modified/2025-W01\n---\n[[B]]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("B.md"),
+            "---\ntags:\n  - modified/2025-W01\n---\nplain\n",
+        )
+        .unwrap();
+
+        let g = Graph::load(&dir).unwrap();
+        let acad = g.tags.iter().position(|t| t == "academic").unwrap() as u16;
+        let a = g.find("A").unwrap() as usize;
+        let b = g.find("B").unwrap() as usize;
+        assert!(g.nodes[a].tags.contains(&acad));
+        assert!(!g.nodes[b].tags.contains(&acad));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

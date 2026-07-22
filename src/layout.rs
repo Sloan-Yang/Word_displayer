@@ -21,16 +21,15 @@ const MAX_DEPTH: u32 = 24;
 const K: f32 = 62.0;
 
 // ---- 气泡漂浮的参数 ----
-/// 游走加速度。配合下面的阻尼，终速大约是 ACCEL * dt / (1 - DAMPING)
-const WANDER_ACCEL: f32 = 42.0;
+/// 力导向力在漂浮时的增益。图已经在平衡点附近，这个值只需把它按住，
+/// 不必很大；太大就会抢过游走、看起来在抽动。
+const FORCE_GAIN: f32 = 26.0;
+/// 游走加速度。有斥力维持结构之后，游走只是点缀，给得很小
+const WANDER_ACCEL: f32 = 9.0;
 /// 速度衰减，按 60fps 每帧计；实际会按 dt 换算，换帧率不影响手感
-const DAMPING: f32 = 0.92;
+const DAMPING: f32 = 0.90;
 /// 限速，世界单位/秒。K 是 62，所以横穿一条边要七八秒
-const MAX_SPEED: f32 = 8.0;
-/// 边的弹簧劲度：把节点拉回理想边长
-const EDGE_SPRING: f32 = 3.0;
-/// 出了槽位之后被推回来的劲度
-const WALL_SPRING: f32 = 6.0;
+const MAX_SPEED: f32 = 9.0;
 /// 斥力倍率。碰撞已经保证不重叠了，斥力只用来把团摊开，所以压得比较低
 const REPULSION: f32 = 0.35;
 /// 碰撞恢复系数，1 是完全弹性
@@ -169,17 +168,16 @@ impl Sim {
         self.alpha = self.alpha.max(amount);
     }
 
-    pub fn step(&mut self) {
+    /// 把力导向的三种力（斥力 + 边引力 + 槽位约束）累加到 `self.disp`。
+    /// 退火 `step` 和漂浮 `drift_step` 用的是同一套力 —— 这样漂浮时图会一直
+    /// 停在退火算出的那个平衡形状上，而不会因为缺了斥力慢慢塌成一团。
+    fn accumulate_forces(&mut self) {
         let n = self.pos.len();
-        if n == 0 {
-            return;
-        }
         for d in &mut self.disp {
             *d = Vec2::ZERO;
         }
 
-        // --- 斥力：只在分量内部算，分量之间靠装箱隔开 ---
-        // 现在「不许重叠」交给碰撞去保证了，斥力只负责把团摊开，可以弱一些
+        // --- 斥力：只在分量内部算，分量之间靠装箱隔开。这是维持「团」形状的关键 ---
         let k2 = K * K * REPULSION;
         for c in &self.comps {
             if c.members.len() < 2 {
@@ -217,6 +215,14 @@ impl Sim {
                 self.disp[i] += dir * (over * over / K) * 2.0;
             }
         }
+    }
+
+    pub fn step(&mut self) {
+        let n = self.pos.len();
+        if n == 0 {
+            return;
+        }
+        self.accumulate_forces();
 
         // 布局阶段也分开一次，这样即使关掉漂浮，标签也不会叠着
         self.resolve_collisions();
@@ -250,43 +256,23 @@ impl Sim {
             return;
         }
 
-        // --- 游走：方向慢慢转，给一个很小的加速度 ---
+        // 和退火同一套力：斥力把团摊开、边引力把相连的拉近、槽位约束居中。
+        // 缺了斥力就是之前塌成一团的病根，所以这里必须一起算。
+        self.accumulate_forces();
+
         for i in 0..n {
+            // 力导向力作为加速度：图已经在平衡点附近，这只是把它稳稳按住
+            self.vel[i] += self.disp[i] * (FORCE_GAIN * dt);
+
+            // 游走：方向缓慢转动，给一点有机的漂移感，幅度很小别盖过结构
             self.wander[i] += self.wander_rate[i] * dt;
-            let dir = Vec2::angled(self.wander[i]);
-            self.vel[i] += dir * (WANDER_ACCEL * self.drift * dt);
-        }
-
-        // --- 边：回到理想长度的弹簧，别让团被游走力扯散 ---
-        for &(a, b) in &self.edges {
-            let (a, b) = (a as usize, b as usize);
-            let delta = self.pos[b] - self.pos[a];
-            let dist = delta.length().max(0.01);
-            let dir = delta / dist;
-            let f = (dist - self.rest_len(a, b)) * EDGE_SPRING * dt;
-            self.vel[a] += dir * f;
-            self.vel[b] -= dir * f;
-        }
-
-        // --- 槽位软墙：越界就被推回自己的地盘 ---
-        for i in 0..n {
-            let c = &self.comps[self.comp_of[i] as usize];
-            let delta = c.anchor - self.pos[i].to_vec2();
-            let dist = delta.length();
-            if dist < 1e-4 {
-                continue;
-            }
-            let over = dist - c.radius;
-            if over > 0.0 {
-                self.vel[i] += delta / dist * (over * WALL_SPRING * dt);
-            }
+            self.vel[i] += Vec2::angled(self.wander[i]) * (WANDER_ACCEL * self.drift * dt);
         }
 
         self.resolve_collisions();
 
         // --- 积分：阻尼 + 限速，保证是慢悠悠地飘 ---
-        // 阻尼本身是「每帧」的量，按 dt 折算成等效衰减，
-        // 这样 30fps 和 60fps 下气泡的速度和手感一致
+        // 阻尼是「每帧」的量，按 dt 折算成等效衰减，30fps 和 60fps 手感一致
         let damping = DAMPING.powf(dt * 60.0);
         for i in 0..n {
             if Some(i) == self.pinned {

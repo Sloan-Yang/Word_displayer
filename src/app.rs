@@ -15,6 +15,45 @@ enum Theme {
     Dark,
 }
 
+/// 节点形状。单词库用胶囊（词本身就是节点），笔记库用圆形 + 下方标题。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeShape {
+    Pill,
+    Circle,
+}
+
+/// 标签在筛选里的状态：普通不影响；只看=白名单；隐藏=黑名单。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TagState {
+    Only,
+    Hidden,
+}
+
+/// 一个可视化的库：一个目录 + 一种节点形状。
+#[derive(Clone)]
+struct Library {
+    name: String,
+    path: std::path::PathBuf,
+    shape: NodeShape,
+}
+
+/// 预置的库。第一个是默认启动的。想加自己的库，在这里加一行，
+/// 或者用「高级显示设置」里的数据源路径临时切换。
+fn preset_libraries() -> Vec<Library> {
+    vec![
+        Library {
+            name: "单词".into(),
+            path: r"D:\Code\Vocab".into(),
+            shape: NodeShape::Pill,
+        },
+        Library {
+            name: "笔记".into(),
+            path: r"D:\Code\Lunarvim_Obsidian".into(),
+            shape: NodeShape::Circle,
+        },
+    ]
+}
+
 /// 词团配色。
 ///
 /// 一个视觉属性只表达一种含义 —— 颜色只表示「属于哪个词团」，
@@ -219,6 +258,15 @@ pub struct App {
     dragging: Option<usize>,
     search: String,
 
+    /// 标签筛选状态，按标签名存 —— 换库后标签名不同，自然只保留能对上的。
+    tag_filter: HashMap<String, TagState>,
+
+    // 库
+    libraries: Vec<Library>,
+    /// 当前是哪个预置库；用自定义路径加载后为 None
+    current_lib: Option<usize>,
+    shape: NodeShape,
+
     // 外观
     drifting: bool,
     drift_speed: f32,
@@ -241,9 +289,22 @@ impl App {
         let hotkey_signal = hotkey::new_signal();
         let hotkey_registered = hotkey::spawn(cc.egui_ctx.clone(), hotkey_signal.clone());
 
+        // 启动路径若匹配某个预置库，就采用它的形状；否则按胶囊算
+        let libraries = preset_libraries();
+        let current_lib = libraries
+            .iter()
+            .position(|l| same_path(&l.path, &root));
+        let shape = current_lib
+            .map(|i| libraries[i].shape)
+            .unwrap_or(NodeShape::Pill);
+
         let last = graph.weeks.len().saturating_sub(1);
         let app = App {
             ctx: cc.egui_ctx.clone(),
+            tag_filter: HashMap::new(),
+            libraries,
+            current_lib,
+            shape,
             root_input: root.to_string_lossy().to_string(),
             week_lo: last.saturating_sub(3),
             week_hi: last,
@@ -344,6 +405,21 @@ impl App {
         let mut ids: Vec<u32> = seen.into_iter().collect();
         ids.sort_unstable();
 
+        // 标签筛选：黑名单里的标签一律不显示；一旦有白名单，只留命中白名单的
+        let (only, hidden) = self.tag_index_sets();
+        if !only.is_empty() || !hidden.is_empty() {
+            ids.retain(|&i| {
+                let tags = &g.nodes[i as usize].tags;
+                if hidden.iter().any(|h| tags.contains(h)) {
+                    return false;
+                }
+                if !only.is_empty() && !only.iter().any(|o| tags.contains(o)) {
+                    return false;
+                }
+                true
+            });
+        }
+
         if self.hide_isolated {
             let set: HashSet<u32> = ids.iter().copied().collect();
             ids.retain(|&i| {
@@ -354,6 +430,35 @@ impl App {
             });
         }
         ids
+    }
+
+    /// 把按名字存的标签筛选，翻译成当前图里的标签下标集合 (只看, 隐藏)。
+    fn tag_index_sets(&self) -> (Vec<u16>, Vec<u16>) {
+        let mut only = Vec::new();
+        let mut hidden = Vec::new();
+        for (name, state) in &self.tag_filter {
+            if let Some(idx) = self.graph.tags.iter().position(|t| t == name) {
+                match state {
+                    TagState::Only => only.push(idx as u16),
+                    TagState::Hidden => hidden.push(idx as u16),
+                }
+            }
+        }
+        (only, hidden)
+    }
+
+    /// 每个标签有多少个节点，用来把常用标签排在前面。
+    fn tag_counts(&self) -> Vec<(usize, usize)> {
+        let mut counts = vec![0usize; self.graph.tags.len()];
+        for node in &self.graph.nodes {
+            for &t in &node.tags {
+                counts[t as usize] += 1;
+            }
+        }
+        let mut v: Vec<(usize, usize)> = counts.into_iter().enumerate().map(|(i, c)| (i, c)).collect();
+        // 频次高的在前，同频按名字
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| self.graph.tags[a.0].cmp(&self.graph.tags[b.0])));
+        v
     }
 
     /// 当前时间范围内、但因为没有任何联系而被藏起来的词数。
@@ -395,6 +500,80 @@ impl App {
         }
     }
 
+    /// 切到某个预置库：换目录、换形状、重新加载。
+    fn switch_library(&mut self, index: usize) {
+        let Some(lib) = self.libraries.get(index).cloned() else {
+            return;
+        };
+        self.root_input = lib.path.to_string_lossy().to_string();
+        self.shape = lib.shape;
+        self.current_lib = Some(index);
+        self.focus = None;
+        self.selected = None;
+        self.reload();
+    }
+
+    /// 在库之间循环切换（Ctrl+Shift+←/→）。
+    fn cycle_library(&mut self, delta: i32) {
+        let n = self.libraries.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.current_lib.unwrap_or(0) as i32;
+        let next = (cur + delta).rem_euclid(n as i32) as usize;
+        self.switch_library(next);
+    }
+
+    /// 把当前数据源路径添加成一个新库，并切过去。目录名当库名。
+    fn add_library_from_input(&mut self) {
+        let path = std::path::PathBuf::from(self.root_input.trim());
+        if self.root_input.trim().is_empty() {
+            return;
+        }
+        // 已经有同路径的库就直接切过去，不重复添加
+        if let Some(i) = self.libraries.iter().position(|l| same_path(&l.path, &path)) {
+            self.switch_library(i);
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "新库".to_string());
+        self.libraries.push(Library {
+            name,
+            path,
+            shape: self.shape,
+        });
+        self.switch_library(self.libraries.len() - 1);
+    }
+
+    /// 移除一个库。至少保留一个；移除当前库时切到邻近的。
+    fn remove_library(&mut self, index: usize) {
+        if self.libraries.len() <= 1 || index >= self.libraries.len() {
+            return;
+        }
+        self.libraries.remove(index);
+        match self.current_lib {
+            Some(cur) if cur == index => {
+                // 删的是当前库：切到同位置（现在是下一个）或最后一个
+                let next = index.min(self.libraries.len() - 1);
+                self.switch_library(next);
+            }
+            Some(cur) if cur > index => self.current_lib = Some(cur - 1),
+            _ => {}
+        }
+    }
+
+    /// 圆形节点的半径（世界单位）。连接数越多越大。
+    fn circle_radius(&self, degree: usize) -> f32 {
+        (10.0 + 5.0 * (degree as f32).sqrt()).clamp(10.0, 40.0) * self.node_scale
+    }
+
+    /// 圆形节点下方标题的字号。不随连接数变（那由圆的大小表达）。
+    fn circle_label_font(&self) -> f32 {
+        LABEL_FONT * 0.95 * self.node_scale.clamp(0.7, 1.5)
+    }
+
     /// 一个节点的字号（世界单位）。连接数越多的词越大 ——
     /// 「节点大小」这个视觉属性只表达连接数，不表达别的。
     fn node_font(&self, degree: usize) -> f32 {
@@ -414,17 +593,35 @@ impl App {
             .iter()
             .filter(|nb| local.contains_key(nb))
             .count();
-        let font = self.node_font(deg);
-        let size = self.ctx.fonts(|f| {
-            f.layout_no_wrap(
-                node.name.clone(),
-                egui::FontId::proportional(font),
-                Color32::WHITE,
-            )
-            .size()
-        });
-        let half = Vec2::new(size.x * 0.5 + font * 0.62, size.y * 0.5 + font * 0.34);
-        layout::Extent { half, off_y: 0.0 }
+        let measure = |text: &str, font: f32| {
+            self.ctx.fonts(|f| {
+                f.layout_no_wrap(text.to_owned(), egui::FontId::proportional(font), Color32::WHITE)
+                    .size()
+            })
+        };
+        match self.shape {
+            NodeShape::Pill => {
+                // 胶囊：词本身就是节点，包围盒 = 文字尺寸 + 内边距
+                let font = self.node_font(deg);
+                let size = measure(&node.name, font);
+                let half = Vec2::new(size.x * 0.5 + font * 0.62, size.y * 0.5 + font * 0.34);
+                layout::Extent { half, off_y: 0.0 }
+            }
+            NodeShape::Circle => {
+                // 圆形：圆在上、标题在下，包围盒罩住两者
+                let r = self.circle_radius(deg);
+                let font = self.circle_label_font();
+                let size = measure(&node.name, font);
+                let gap = font * 0.3;
+                let top = -r;
+                let bottom = r + gap + size.y;
+                let half = Vec2::new((size.x * 0.5 + 3.0).max(r), (bottom - top) * 0.5);
+                layout::Extent {
+                    half,
+                    off_y: (top + bottom) * 0.5,
+                }
+            }
+        }
     }
 
     fn reload(&mut self) {
@@ -582,6 +779,20 @@ impl eframe::App for App {
         // 多屏之间来回拖之后位置乱了，用这个一键归位。
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
             hotkey::snap_top_center();
+        }
+
+        // Ctrl+Shift+←/→ 在库之间切换
+        let (prev_lib, next_lib) = ctx.input(|i| {
+            let combo = i.modifiers.command && i.modifiers.shift;
+            (
+                combo && i.key_pressed(egui::Key::ArrowLeft),
+                combo && i.key_pressed(egui::Key::ArrowRight),
+            )
+        });
+        if prev_lib {
+            self.cycle_library(-1);
+        } else if next_lib {
+            self.cycle_library(1);
         }
 
         // F11 全屏。放在这里而不是画布里，是因为焦点在卡片上时画布收不到按键
@@ -891,9 +1102,13 @@ impl App {
                             .max_height(card.height() - 150.0)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
+                                self.library_controls(ui);
+                                ui.add_space(12.0);
                                 self.time_controls(ui);
                                 ui.add_space(12.0);
                                 self.scope_controls(ui);
+                                ui.add_space(12.0);
+                                self.tag_controls(ui);
                                 ui.add_space(12.0);
                                 self.search_controls(ui);
                                 ui.add_space(12.0);
@@ -915,7 +1130,7 @@ impl App {
                         } else {
                             ui.weak("Ctrl+9 被占用，只在窗口内生效");
                         }
-                        ui.weak("Ctrl+F 搜索 · F5 刷新词库 · Esc 关详情");
+                        ui.weak("Ctrl+F 搜索 · F5 刷新 · Esc 关详情 · Ctrl+Shift+←/→ 切库");
                         ui.weak("F 复位视野 · F11 全屏 · 方向键平移");
                         ui.weak("+/− 缩放 · 按住 Shift 加速");
                         ui.weak("Ctrl+N 窗口归位（多屏拖乱了用它）");
@@ -1026,10 +1241,112 @@ impl App {
         }
     }
 
+    /// 标签筛选。点一下在 普通→只看→隐藏→普通 之间循环。
+    /// 「只看」是白名单（可多选，命中任一即显示），「隐藏」是黑名单。
+    fn tag_controls(&mut self, ui: &mut egui::Ui) {
+        if self.graph.tags.is_empty() {
+            return;
+        }
+        let counts = self.tag_counts();
+        let active = self.tag_filter.len();
+        let title = if active > 0 {
+            format!("标签筛选（{active} 个生效）")
+        } else {
+            "标签筛选".to_string()
+        };
+
+        egui::CollapsingHeader::new(title)
+            .id_salt("tag-filter")
+            .default_open(active > 0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak("点击循环：普通 / 只看 / 隐藏");
+                    if active > 0 && ui.small_button("清空").clicked() {
+                        self.tag_filter.clear();
+                    }
+                });
+                ui.add_space(2.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (idx, count) in counts {
+                                if count == 0 {
+                                    continue;
+                                }
+                                let name = self.graph.tags[idx].clone();
+                                let state = self.tag_filter.get(&name).copied();
+                                let (text, color) = match state {
+                                    None => (
+                                        RichText::new(&name),
+                                        None,
+                                    ),
+                                    Some(TagState::Only) => (
+                                        RichText::new(format!("只看 {name}")).strong(),
+                                        Some(Color32::from_rgb(0x3C, 0x8A, 0x4E)),
+                                    ),
+                                    Some(TagState::Hidden) => (
+                                        RichText::new(format!("隐藏 {name}")).strikethrough(),
+                                        Some(Color32::from_rgb(0xC0, 0x53, 0x4B)),
+                                    ),
+                                };
+                                let text = match color {
+                                    Some(c) => text.color(c),
+                                    None => text.weak(),
+                                };
+                                let resp = ui
+                                    .add(egui::Button::new(text))
+                                    .on_hover_text(format!("{count} 个笔记"));
+                                if resp.clicked() {
+                                    let next = match state {
+                                        None => Some(TagState::Only),
+                                        Some(TagState::Only) => Some(TagState::Hidden),
+                                        Some(TagState::Hidden) => None,
+                                    };
+                                    match next {
+                                        Some(st) => {
+                                            self.tag_filter.insert(name, st);
+                                        }
+                                        None => {
+                                            self.tag_filter.remove(&name);
+                                        }
+                                    }
+                                    self.rebuild();
+                                }
+                            }
+                        });
+                    });
+            });
+    }
+
+    /// 库切换：每个预置库一个按钮，高亮当前那个。
+    fn library_controls(&mut self, ui: &mut egui::Ui) {
+        let mut switch: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("库").strong());
+            for (i, lib) in self.libraries.iter().enumerate() {
+                let selected = self.current_lib == Some(i);
+                if ui
+                    .selectable_label(selected, &lib.name)
+                    .on_hover_text(lib.path.to_string_lossy())
+                    .clicked()
+                    && !selected
+                {
+                    switch = Some(i);
+                }
+            }
+        });
+        if let Some(i) = switch {
+            self.switch_library(i);
+        }
+    }
+
     fn search_controls(&mut self, ui: &mut egui::Ui) {
         let resp = ui.add(
             egui::TextEdit::singleline(&mut self.search)
-                .hint_text("搜索单词，回车定位  (Ctrl+F)")
+                .hint_text("搜索，回车定位  (Ctrl+F)")
                 .desired_width(f32::INFINITY),
         );
         if self.focus_search {
@@ -1050,8 +1367,18 @@ impl App {
                 if self.drifting {
                     ui.add(egui::Slider::new(&mut self.drift_speed, 0.1..=2.5).text("漂浮速度"));
                 }
+                ui.horizontal(|ui| {
+                    ui.label("节点形状");
+                    let mut shape = self.shape;
+                    ui.selectable_value(&mut shape, NodeShape::Pill, "胶囊");
+                    ui.selectable_value(&mut shape, NodeShape::Circle, "圆形");
+                    if shape != self.shape {
+                        self.shape = shape;
+                        self.rebuild();
+                    }
+                });
                 if ui
-                    .add(egui::Slider::new(&mut self.node_scale, 0.5..=2.0).text("单词大小"))
+                    .add(egui::Slider::new(&mut self.node_scale, 0.5..=2.0).text("节点大小"))
                     .changed()
                 {
                     // 大小变了，碰撞盒也得跟着变，只能重排
@@ -1060,13 +1387,37 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.edge_alpha, 20..=260).text("连线浓度"));
 
                 ui.add_space(6.0);
-                ui.label(RichText::new("数据源").strong());
+                ui.label(RichText::new("库管理").strong());
                 ui.add(
                     egui::TextEdit::singleline(&mut self.root_input)
+                        .hint_text("目录路径，例如 D:\\Code\\Notes")
                         .desired_width(f32::INFINITY),
                 );
-                if ui.button("重新加载（F5）").clicked() {
-                    self.reload();
+                ui.horizontal(|ui| {
+                    if ui.button("添加为库").clicked() {
+                        self.add_library_from_input();
+                    }
+                    if ui.button("重新加载（F5）").clicked() {
+                        self.reload();
+                    }
+                });
+
+                // 已有的库，每个后面一个「移除」；只剩一个时不给移除
+                let can_remove = self.libraries.len() > 1;
+                let mut remove: Option<usize> = None;
+                for (i, lib) in self.libraries.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let mark = if self.current_lib == Some(i) { "● " } else { "   " };
+                        ui.weak(format!("{mark}{}", lib.name));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if can_remove && ui.small_button("移除").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    });
+                }
+                if let Some(i) = remove {
+                    self.remove_library(i);
                 }
 
                 ui.add_space(6.0);
@@ -1273,7 +1624,9 @@ impl App {
         // 是 Some，方向键和缩放会被整个屏蔽掉。`wants_keyboard_input()` 才是
         // 「当前有文本框在收键盘」的意思。
         let typing = ui.ctx().wants_keyboard_input();
-        if !typing {
+        // Ctrl 组合键（如 Ctrl+Shift+←/→ 切库）不应触发平移
+        let combo = ui.input(|i| i.modifiers.command);
+        if !typing && !combo {
             // 长按取 key_down（连续），单击取 key_pressed（离散一步）。
             // 只用 key_down 的话，快速点一下有可能整个落在两帧之间，
             // 采样时已经抬起来了 —— 表现就是「按了没反应」。
@@ -1468,7 +1821,7 @@ impl App {
 
         // ---- 画节点：单词本身就是节点 ----
         let mut shapes: Vec<Shape> = Vec::with_capacity(self.sim.len() * 3);
-        let mut texts: Vec<(Pos2, String, f32, Color32)> = Vec::new();
+        let mut texts: Vec<(Pos2, Align2, String, f32, Color32)> = Vec::new();
         let cull = rect.expand(80.0);
         let mut visible_count = 0usize;
 
@@ -1499,25 +1852,6 @@ impl App {
             let bottom = mix(hue, pal.chip_base, pal.chip_bottom_mix);
             let border = mix(hue, pal.chip_base, pal.chip_border_mix);
 
-            // 选中的外发光：几层向外扩散的圆角矩形
-            if selected {
-                for k in 1..=3 {
-                    let grow = 3.0 * k as f32;
-                    shapes.push(Shape::Path(egui::epaint::PathShape::convex_polygon(
-                        pill_points(chip.expand(grow), chip.height() * 0.5 + grow),
-                        hue.gamma_multiply(0.13 / k as f32),
-                        Stroke::NONE,
-                    )));
-                }
-            }
-
-            gradient_pill(
-                &mut shapes,
-                chip,
-                top.gamma_multiply(alpha),
-                bottom.gamma_multiply(alpha),
-            );
-
             let (stroke_c, stroke_w) = if selected {
                 (mix(hue, pal.text_strong, 0.25), 2.2)
             } else if hovered {
@@ -1527,34 +1861,84 @@ impl App {
             } else {
                 (border.gamma_multiply(alpha), 1.0)
             };
-            shapes.push(Shape::closed_line(
-                pill_points(chip, chip.height() * 0.5),
-                Stroke::new(stroke_w, stroke_c),
-            ));
 
-            // 字太小就不画了，但走的是渐隐而不是突然消失 —— 之前节点闪烁就是
-            // 因为按「装得下就画」的硬阈值取舍，位置一动结论就翻转
-            let font_px = self.node_font(self.sim.degree[i] as usize) * self.zoom;
-            let text_fade = ((font_px - 4.5) / 3.5).clamp(0.0, 1.0);
-            if text_fade > 0.01 {
-                texts.push((
-                    chip.center(),
-                    node.name.clone(),
-                    font_px,
-                    pal.text_strong.gamma_multiply(alpha * text_fade),
-                ));
+            match self.shape {
+                NodeShape::Pill => {
+                    // 选中的外发光：几层向外扩散的圆角矩形
+                    if selected {
+                        for k in 1..=3 {
+                            let grow = 3.0 * k as f32;
+                            shapes.push(Shape::Path(egui::epaint::PathShape::convex_polygon(
+                                pill_points(chip.expand(grow), chip.height() * 0.5 + grow),
+                                hue.gamma_multiply(0.13 / k as f32),
+                                Stroke::NONE,
+                            )));
+                        }
+                    }
+                    gradient_pill(
+                        &mut shapes,
+                        chip,
+                        top.gamma_multiply(alpha),
+                        bottom.gamma_multiply(alpha),
+                    );
+                    shapes.push(Shape::closed_line(
+                        pill_points(chip, chip.height() * 0.5),
+                        Stroke::new(stroke_w, stroke_c),
+                    ));
+
+                    // 字太小就不画了，但走的是渐隐而不是突然消失
+                    let font_px = self.node_font(self.sim.degree[i] as usize) * self.zoom;
+                    let text_fade = ((font_px - 4.5) / 3.5).clamp(0.0, 1.0);
+                    if text_fade > 0.01 {
+                        texts.push((
+                            chip.center(),
+                            Align2::CENTER_CENTER,
+                            node.name.clone(),
+                            font_px,
+                            pal.text_strong.gamma_multiply(alpha * text_fade),
+                        ));
+                    }
+                }
+                NodeShape::Circle => {
+                    // 圆心就是节点锚点，标题挂在圆的正下方
+                    let rc = self.circle_radius(self.sim.degree[i] as usize) * self.zoom;
+                    if selected {
+                        for k in 1..=3 {
+                            let grow = 3.0 * k as f32;
+                            shapes.push(Shape::circle_filled(
+                                sp,
+                                rc + grow,
+                                hue.gamma_multiply(0.13 / k as f32),
+                            ));
+                        }
+                    }
+                    let sq = Rect::from_center_size(sp, Vec2::splat(rc * 2.0));
+                    gradient_pill(
+                        &mut shapes,
+                        sq,
+                        top.gamma_multiply(alpha),
+                        bottom.gamma_multiply(alpha),
+                    );
+                    shapes.push(Shape::circle_stroke(sp, rc, Stroke::new(stroke_w, stroke_c)));
+
+                    let font_px = self.circle_label_font() * self.zoom;
+                    let text_fade = ((font_px - 4.5) / 3.5).clamp(0.0, 1.0);
+                    if text_fade > 0.01 {
+                        texts.push((
+                            sp + Vec2::new(0.0, rc + font_px * 0.3),
+                            Align2::CENTER_TOP,
+                            node.name.clone(),
+                            font_px,
+                            pal.text_strong.gamma_multiply(alpha * text_fade),
+                        ));
+                    }
+                }
             }
         }
         painter.extend(shapes);
 
-        for (pos, text, font, color) in texts {
-            painter.text(
-                pos,
-                Align2::CENTER_CENTER,
-                text,
-                FontId::proportional(font),
-                color,
-            );
+        for (pos, align, text, font, color) in texts {
+            painter.text(pos, align, text, FontId::proportional(font), color);
         }
 
         // ---- 悬停提示 ----
@@ -1587,7 +1971,7 @@ impl App {
         painter.text(
             content.left_bottom() + Vec2::new(4.0, -2.0),
             Align2::LEFT_BOTTOM,
-            format!("视野内 {visible_count} / {} 个词", self.sim.len()),
+            format!("视野内 {visible_count} / {} 个节点", self.sim.len()),
             FontId::proportional(11.0),
             pal.text_weak.gamma_multiply(0.7),
         );
@@ -1595,6 +1979,16 @@ impl App {
 }
 
 // ------------------------------------------------------------------ 小工具
+
+/// 两个路径是否指向同一个目录（忽略大小写和尾部斜杠，够用了）。
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_lowercase()
+    };
+    norm(a) == norm(b)
+}
 
 fn segment_visible(rect: Rect, a: Pos2, b: Pos2) -> bool {
     // 粗筛：两端点的包围盒和视口相交即认为可见
