@@ -2,8 +2,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod globe;
 mod hotkey;
 mod layout;
+mod reading;
 mod vocab;
 
 use std::path::PathBuf;
@@ -33,6 +35,8 @@ fn main() -> eframe::Result<()> {
             .with_transparent(true)
             .with_resizable(true)
             .with_title("LEXIS · Word Atlas"),
+        // 阅读地图那颗三维地球要用深度缓冲，让正面半球盖住背面
+        depth_buffer: 24,
         ..Default::default()
     };
 

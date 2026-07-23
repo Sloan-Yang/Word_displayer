@@ -284,7 +284,7 @@ fn parse_one(name: String, path: PathBuf, text: &str) -> Parsed {
 }
 
 /// 返回 (frontmatter, 正文)。没有 frontmatter 时前半为空。
-fn split_frontmatter(text: &str) -> (&str, &str) {
+pub(crate) fn split_frontmatter(text: &str) -> (&str, &str) {
     let t = text.strip_prefix('\u{feff}').unwrap_or(text);
     let rest = match t.strip_prefix("---\n").or_else(|| t.strip_prefix("---\r\n")) {
         Some(r) => r,
@@ -302,7 +302,7 @@ fn split_frontmatter(text: &str) -> (&str, &str) {
 }
 
 /// 从 frontmatter 里抓所有 `modified/YYYY-Www`（也接受其它前缀的同格式标签）。
-fn parse_weeks(front: &str) -> Vec<Week> {
+pub(crate) fn parse_weeks(front: &str) -> Vec<Week> {
     let mut out = Vec::new();
     let bytes = front.as_bytes();
     let mut i = 0usize;
