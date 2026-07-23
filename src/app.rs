@@ -18,6 +18,14 @@ enum Theme {
     Dark,
 }
 
+/// 主题模式。自动模式按本地时间在白天/黑夜之间切换。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeMode {
+    Auto,
+    Light,
+    Dark,
+}
+
 /// 节点形状。单词库用胶囊（词本身就是节点），笔记库用圆形 + 下方标题。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NodeShape {
@@ -274,6 +282,8 @@ pub struct App {
     tiny_frames: u32,
     /// 背景图。解码要用 Context，所以也是首帧才上传
     backdrop: Option<egui::TextureHandle>,
+    /// 暗色主题下的星空背景
+    night_backdrop: Option<egui::TextureHandle>,
     /// 左侧栏的背景图
     sidebar_backdrop: Option<egui::TextureHandle>,
     /// 左侧面板是否展开
@@ -320,6 +330,9 @@ pub struct App {
     // 外观
     drifting: bool,
     drift_speed: f32,
+    /// 用户选的主题模式（自动 / 亮 / 暗）
+    theme_mode: ThemeMode,
+    /// 当前生效的主题，由 `theme_mode` 每帧解算得到
     theme: Theme,
     /// 已经套用到 egui 上的主题，变了才重新设置样式
     applied_theme: Option<Theme>,
@@ -353,7 +366,12 @@ impl App {
 
         // 三维地球的 GL 资源要趁现在（拿得到 glow 上下文）建好
         let (globe, globe_error) = match cc.gl.as_ref() {
-            Some(gl) => match Globe::new(gl, load_earth_mask(), load_earth_surface()) {
+            Some(gl) => match Globe::new(
+                gl,
+                load_earth_mask(),
+                load_earth_surface(),
+                load_earth_lights(),
+            ) {
                 Ok(g) => (Some(Arc::new(Mutex::new(g))), None),
                 Err(e) => (None, Some(e)),
             },
@@ -374,7 +392,7 @@ impl App {
             globe,
             globe_error,
             spin: 0.0,
-            auto_spin: false,
+            auto_spin: true,
             spin_speed: 1.0,
             camera_yaw,
             camera_pitch,
@@ -409,11 +427,13 @@ impl App {
             monitor_snap_frames: 0,
             tiny_frames: 0,
             backdrop: None,
+            night_backdrop: None,
             sidebar_backdrop: None,
             show_sidebar: true,
             focus_search: false,
             drifting: true,
             drift_speed: 1.0,
+            theme_mode: ThemeMode::Auto,
             theme: Theme::Light,
             applied_theme: None,
             edge_alpha: 100,
@@ -421,6 +441,23 @@ impl App {
         };
         // 这里不能 rebuild：字体还没就绪，量不了单词的宽度
         app
+    }
+
+    /// 解算当前该用哪个主题。自动模式按本地时间：白天（7:00–19:00）用亮色，
+    /// 其余时间用暗色星空。
+    fn resolve_theme(&self) -> Theme {
+        match self.theme_mode {
+            ThemeMode::Light => Theme::Light,
+            ThemeMode::Dark => Theme::Dark,
+            ThemeMode::Auto => {
+                let h = hotkey::local_hour();
+                if (7..19).contains(&h) {
+                    Theme::Light
+                } else {
+                    Theme::Dark
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------- 显示 / 隐藏
@@ -853,6 +890,8 @@ impl eframe::App for App {
         }
         self.handle_visibility(ctx);
 
+        // 主题：自动模式按本地时间在白天/黑夜之间切换
+        self.theme = self.resolve_theme();
         if self.applied_theme != Some(self.theme) {
             apply_theme(ctx, self.theme);
             self.applied_theme = Some(self.theme);
@@ -870,6 +909,7 @@ impl eframe::App for App {
                 self.rebuild();
             }
             self.backdrop = load_texture(ctx, "backdrop", BKG_BYTES);
+            self.night_backdrop = load_texture(ctx, "night", NIGHT_BKG_BYTES);
             self.sidebar_backdrop = load_texture(ctx, "sidebar", TAB_BKG_BYTES);
         }
 
@@ -1054,14 +1094,19 @@ impl App {
         let pts = round_rect_points(screen.shrink(0.5), [self.effective_radius(ctx); 4]);
 
         painter.add(Shape::convex_polygon(pts.clone(), pal.panel, Stroke::NONE));
-        if let Some(tex) = &self.backdrop {
-            painter.add(textured_fan(screen, &pts, tex.id(), pal.bg_tint));
-            if pal.bg_veil.a() > 0 {
-                painter.add(Shape::convex_polygon(
-                    pts.clone(),
-                    pal.bg_veil,
-                    Stroke::NONE,
-                ));
+        // 暗色主题铺星空（本身就暗，直接原色显示、不盖薄纱）；亮色用清淡底图
+        let (tex, tint, veil) = match self.theme {
+            Theme::Dark => (
+                self.night_backdrop.as_ref().or(self.backdrop.as_ref()),
+                Color32::WHITE,
+                Color32::TRANSPARENT,
+            ),
+            Theme::Light => (self.backdrop.as_ref(), pal.bg_tint, pal.bg_veil),
+        };
+        if let Some(tex) = tex {
+            painter.add(textured_fan(screen, &pts, tex.id(), tint));
+            if veil.a() > 0 {
+                painter.add(Shape::convex_polygon(pts.clone(), veil, Stroke::NONE));
             }
         }
         painter.add(Shape::closed_line(pts, Stroke::new(1.2, pal.window_border)));
@@ -1262,8 +1307,9 @@ impl App {
                                             self.selected = None;
                                         }
                                     }
-                                    ui.selectable_value(&mut self.theme, Theme::Light, "亮");
-                                    ui.selectable_value(&mut self.theme, Theme::Dark, "暗");
+                                    ui.selectable_value(&mut self.theme_mode, ThemeMode::Auto, "自动");
+                                    ui.selectable_value(&mut self.theme_mode, ThemeMode::Light, "亮");
+                                    ui.selectable_value(&mut self.theme_mode, ThemeMode::Dark, "暗");
                                 });
                                 ui.add_space(10.0);
                                 self.advanced_controls(ui);
@@ -2264,13 +2310,13 @@ impl App {
             }
         }
 
-        ui.checkbox(&mut self.auto_spin, "自动自转");
+        ui.checkbox(&mut self.auto_spin, "自动自转（空格切换）");
         if self.auto_spin {
             ui.add(egui::Slider::new(&mut self.spin_speed, 0.0..=3.0).text("自转速度"));
         }
         ui.add_space(4.0);
         ui.weak("拖动或方向键环绕观察 · +/− 或滚轮缩放");
-        ui.weak("点光点看书 · 双击开 md · F 复位视角");
+        ui.weak("空格 开/停自转 · 点光点看书 · 双击开 md · F 复位");
     }
 
     /// 一本书是否落在当前时间范围里。
@@ -2305,14 +2351,13 @@ impl App {
         CLUSTER_LIGHT[ci % CLUSTER_LIGHT.len()]
     }
 
-    /// 回到以东亚为中心的标准视角，并暂停自转让目标保持在镜头正中。
+    /// 回到以东亚为中心的标准视角。自转是否开启由用户用空格键控制，这里不动它。
     fn reset_globe_camera(&mut self) {
         let (yaw, pitch) =
             globe::camera_angles_for(GLOBE_HOME_LAT, GLOBE_HOME_LON, self.spin);
         self.camera_yaw = yaw.rem_euclid(std::f32::consts::TAU);
         self.camera_pitch = pitch;
         self.globe_zoom = 1.0;
-        self.auto_spin = false;
     }
 
     /// 三维地球视图。地球本体走 OpenGL 回调，漂浮的作家/作品光点用同一套
@@ -2331,7 +2376,6 @@ impl App {
             self.camera_yaw -= d.x * 0.006;
             self.camera_pitch =
                 (self.camera_pitch - d.y * 0.006).clamp(-1.45, 1.45);
-            self.auto_spin = false;
         }
         if self.auto_spin && !resp.dragged() {
             self.spin += dt * 0.10 * self.spin_speed;
@@ -2366,7 +2410,6 @@ impl App {
                 self.camera_yaw += orbit.x;
                 self.camera_pitch =
                     (self.camera_pitch + orbit.y).clamp(-1.45, 1.45);
-                self.auto_spin = false;
             }
             let rate = if fast { 2.4 } else { 1.3 };
             let mut factor = zin_hold * rate * dt;
@@ -2378,6 +2421,10 @@ impl App {
             }
             if ui.input(|i| i.key_pressed(egui::Key::F)) {
                 self.reset_globe_camera();
+            }
+            // 空格：开始 / 停止自转
+            if ui.input(|i| i.key_pressed(egui::Key::Space)) {
+                self.auto_spin = !self.auto_spin;
             }
         }
         // 滚轮只改变镜头缩放，球心始终留在内容画布中央。
@@ -2398,13 +2445,13 @@ impl App {
         // ---- 地球本体（OpenGL 回调）----
         let (ocean_top, ocean_bottom, land_rgb, grid_rgb, grid_mix, edge, halo) = match self.theme {
             Theme::Dark => (
-                [0.05, 0.10, 0.20],
-                [0.02, 0.04, 0.10],
-                [0.24, 0.33, 0.28], // 陆地：暗青绿
-                [0.30, 0.66, 0.72],
+                [0.08, 0.20, 0.46], // 海洋：深蓝（提亮，暗面也看得出蓝）
+                [0.04, 0.11, 0.28],
+                [0.17, 0.17, 0.23], // 陆地：冷蓝灰 / 月光银，轻微偏紫，融进星空世界观
+                [0.26, 0.50, 0.60],
+                0.12, // 经纬网压得很淡，城市灯光才是主角
                 0.42,
-                0.45,
-                Color32::from_rgb(0x4C, 0xB6, 0xC4),
+                Color32::from_rgb(0x5A, 0x9E, 0xC4),
             ),
             Theme::Light => (
                 [0.20, 0.38, 0.60],
@@ -2431,8 +2478,23 @@ impl App {
                 grid: grid_rgb,
                 grid_mix,
                 surface_mix: match self.theme {
-                    Theme::Dark => 0.38,
+                    // 夜间用纯淡灰大陆 + 白色海岸线，白天才用真实地形底图
+                    Theme::Dark => 0.0,
                     Theme::Light => 0.58,
+                },
+                coast: match self.theme {
+                    // 大陆边缘勾一条淡淡的亮线
+                    Theme::Dark => 0.4,
+                    Theme::Light => 0.0,
+                },
+                city: match self.theme {
+                    Theme::Dark => 1.0,
+                    Theme::Light => 0.0,
+                },
+                relief: match self.theme {
+                    // 夜间给月光陆地一点地形起伏
+                    Theme::Dark => 0.8,
+                    Theme::Light => 0.0,
                 },
                 edge_darken: edge,
             };
@@ -2580,13 +2642,22 @@ impl App {
                     );
                 }
                 if va > 0.02 {
+                    // 一闪一闪：外发光和描边随时间脉动，核心只轻微起伏不熄灭
+                    let tw = 0.55 + 0.45 * (time * 2.3 + ai as f32 * 1.7).sin();
                     let ar = 4.6 * dot_scale;
-                    painter.circle_filled(ap, ar + 4.5, base.gamma_multiply(0.16 * va));
-                    painter.circle_filled(ap, ar, base.gamma_multiply(0.95 * va));
+                    painter.circle_filled(
+                        ap,
+                        ar + 4.5 + 2.5 * tw,
+                        base.gamma_multiply(0.18 * va * tw),
+                    );
+                    painter.circle_filled(ap, ar, base.gamma_multiply(va * (0.78 + 0.22 * tw)));
                     painter.circle_stroke(
                         ap,
                         ar,
-                        Stroke::new(1.3, mix(base, pal.text_strong, 0.55).gamma_multiply(0.55 * va)),
+                        Stroke::new(
+                            1.3,
+                            mix(base, pal.text_strong, 0.55).gamma_multiply((0.35 + 0.45 * tw) * va),
+                        ),
                     );
                     if va > 0.6 {
                         labels.push((
@@ -2628,7 +2699,12 @@ impl App {
                     } else {
                         3.3
                     }) * dot_scale;
-                    painter.circle_filled(bp, rad + 3.5, color.gamma_multiply(0.20 * alpha));
+                    let twb = 0.6 + 0.4 * (time * 2.0 + bi as f32 * 2.3).sin();
+                    painter.circle_filled(
+                        bp,
+                        rad + 3.5 + 1.5 * twb,
+                        color.gamma_multiply(0.20 * alpha * twb),
+                    );
                     painter.circle_filled(bp, rad, color.gamma_multiply(0.95 * alpha));
 
                     if sel || hov {
@@ -3005,10 +3081,14 @@ fn textured_fan(rect: Rect, pts: &[Pos2], tex: egui::TextureId, tint: Color32) -
 /// 换图的话替换 `assets/` 里的文件再重新编译即可。
 const BKG_BYTES: &[u8] = include_bytes!("../assets/bkg.png");
 const TAB_BKG_BYTES: &[u8] = include_bytes!("../assets/tab_bkg.png");
+/// 暗色主题的星空背景（PIL 程序化生成）。
+const NIGHT_BKG_BYTES: &[u8] = include_bytes!("../assets/night_bkg.png");
 /// 三维地球的陆海遮罩（等距圆柱，白=陆地）。由 NASA Blue Marble 阈值而来。
 const EARTH_MASK_BYTES: &[u8] = include_bytes!("../assets/earth_mask.png");
 /// Natural Earth II 地形底图（公共领域），用于区分东亚、中亚、中东等陆地区域。
 const EARTH_SURFACE_BYTES: &[u8] = include_bytes!("../assets/earth_surface.png");
+/// NASA Black Marble 城市灯光（公共领域），夜间在人口密集处点亮金色灯光。
+const EARTH_LIGHTS_BYTES: &[u8] = include_bytes!("../assets/earth_lights.png");
 
 /// 解码陆海遮罩成单通道，供地球着色器采样。解码失败就退回纯着色海球。
 fn load_earth_mask() -> Option<globe::MaskImage> {
@@ -3023,6 +3103,15 @@ fn load_earth_mask() -> Option<globe::MaskImage> {
 fn load_earth_surface() -> Option<globe::SurfaceImage> {
     let img = image::load_from_memory(EARTH_SURFACE_BYTES).ok()?.to_rgb8();
     Some(globe::SurfaceImage {
+        width: img.width() as i32,
+        height: img.height() as i32,
+        data: img.into_raw(),
+    })
+}
+
+fn load_earth_lights() -> Option<globe::MaskImage> {
+    let img = image::load_from_memory(EARTH_LIGHTS_BYTES).ok()?.to_luma8();
+    Some(globe::MaskImage {
         width: img.width() as i32,
         height: img.height() as i32,
         data: img.into_raw(),
@@ -3050,7 +3139,7 @@ fn open_path(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{remap_week_range, EARTH_MASK_BYTES, EARTH_SURFACE_BYTES};
+    use super::{remap_week_range, EARTH_LIGHTS_BYTES, EARTH_MASK_BYTES, EARTH_SURFACE_BYTES};
     use crate::vocab::Week;
 
     fn week(year: u16, week: u8) -> Week {
@@ -3114,6 +3203,32 @@ mod tests {
         assert!(sample(36.2, 138.3) > 200, "日本坐标必须落在陆地");
         assert!(sample(39.0, 35.2) > 200, "土耳其坐标必须落在陆地");
         assert!(sample(0.0, -150.0) < 40, "太平洋坐标必须落在海洋");
+    }
+
+    #[test]
+    fn city_lights_decode_and_light_up_populated_areas() {
+        let lights = image::load_from_memory(EARTH_LIGHTS_BYTES)
+            .expect("城市灯光解码失败")
+            .to_luma8();
+        let (w, h) = lights.dimensions();
+        assert_eq!(w, h * 2, "灯光图必须是 2:1 等距圆柱");
+        // 取一小块邻域的最大值，避开城市之间的缝隙
+        let bright = |lat: f32, lon: f32| {
+            let cx = (((lon + 180.0) / 360.0) * w as f32) as i32;
+            let cy = (((90.0 - lat) / 180.0) * h as f32) as i32;
+            let mut m = 0u8;
+            for dy in -12..=12 {
+                for dx in -12..=12 {
+                    let x = (cx + dx).rem_euclid(w as i32) as u32;
+                    let y = (cy + dy).clamp(0, h as i32 - 1) as u32;
+                    m = m.max(lights.get_pixel(x, y).0[0]);
+                }
+            }
+            m
+        };
+        assert!(bright(40.0, -74.0) > 150, "纽约附近应有城市灯光");
+        assert!(bright(31.0, 121.0) > 150, "上海附近应有城市灯光");
+        assert!(bright(0.0, -150.0) < 30, "太平洋应当是暗的");
     }
 }
 

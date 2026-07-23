@@ -443,12 +443,31 @@ mod imp {
 
         rx.recv().unwrap_or(false)
     }
+
+    /// 当前本地时间的小时（0–23），用来做白天/黑夜主题自动切换。
+    pub fn local_hour() -> u32 {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe { GetLocalTime(&mut st) };
+        st.wHour as u32
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
     pub fn spawn(_ctx: egui::Context, _signal: super::Signal) -> bool {
         false // 其它平台暂时只有窗口内的 Ctrl+9
+    }
+
+    /// 没有本地时区 API 就用 UTC 小时兜底。
+    pub fn local_hour() -> u32 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ((secs / 3600) % 24) as u32
     }
     pub fn is_visible() -> bool {
         true
@@ -475,5 +494,5 @@ mod imp {
 
 pub use imp::{
     apply_window_shape, current_monitor_id, current_monitor_id_away_from, hide, is_visible,
-    restore_size, snap_top_center, snap_top_center_on, spawn,
+    local_hour, restore_size, snap_top_center, snap_top_center_on, spawn,
 };

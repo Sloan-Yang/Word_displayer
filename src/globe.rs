@@ -161,6 +161,12 @@ pub struct Frame {
     pub grid_mix: f32,
     /// 地形底图混入主题陆地色的强度。
     pub surface_mix: f32,
+    /// 白色海岸线的强度（0 关闭）。夜间用它勾出大陆轮廓。
+    pub coast: f32,
+    /// 城市灯光的强度（0 关闭）。夜间在人口密集处叠加金色亮点。
+    pub city: f32,
+    /// 地形起伏强度（0 关闭）。夜间不上色，只用地形明暗给月光陆地一点海拔感。
+    pub relief: f32,
     /// 边缘压暗强度，越大球感越强。
     pub edge_darken: f32,
 }
@@ -191,6 +197,8 @@ pub struct Globe {
     mask: Option<glow::Texture>,
     /// 地形颜色纹理，只在陆地区域内混合。
     surface: Option<glow::Texture>,
+    /// 夜间城市灯光（单通道强度，白天不用）。
+    lights: Option<glow::Texture>,
 }
 
 impl Globe {
@@ -198,6 +206,7 @@ impl Globe {
         gl: &glow::Context,
         mask: Option<MaskImage>,
         surface: Option<SurfaceImage>,
+        lights: Option<MaskImage>,
     ) -> Result<Globe, String> {
         unsafe {
             let program = compile(gl)?;
@@ -307,6 +316,43 @@ impl Globe {
                 Some(tex)
             });
 
+            // 城市灯光：单通道，和遮罩一样的上传方式
+            let lights = lights.and_then(|img| {
+                let tex = gl.create_texture().ok()?;
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::R8 as i32,
+                    img.width,
+                    img.height,
+                    0,
+                    glow::RED,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&img.data)),
+                );
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_T,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    glow::LINEAR_MIPMAP_LINEAR as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    glow::LINEAR as i32,
+                );
+                gl.generate_mipmap(glow::TEXTURE_2D);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                Some(tex)
+            });
+
             Ok(Globe {
                 program,
                 vao,
@@ -315,6 +361,7 @@ impl Globe {
                 index_count: indices.len() as i32,
                 mask,
                 surface,
+                lights,
             })
         }
     }
@@ -358,6 +405,16 @@ impl Globe {
                 if self.surface.is_some() { 1.0 } else { 0.0 },
             );
             gl.uniform_1_f32(u("u_surface_mix").as_ref(), f.surface_mix);
+            gl.uniform_1_f32(u("u_relief").as_ref(), f.relief);
+
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(glow::TEXTURE_2D, self.lights);
+            gl.uniform_1_i32(u("u_lights").as_ref(), 2);
+            gl.uniform_1_f32(
+                u("u_have_lights").as_ref(),
+                if self.lights.is_some() { 1.0 } else { 0.0 },
+            );
+            gl.uniform_1_f32(u("u_city").as_ref(), f.city);
 
             let l = norm3(f.light);
             gl.uniform_3_f32(u("u_light").as_ref(), l[0], l[1], l[2]);
@@ -375,6 +432,7 @@ impl Globe {
             );
             gl.uniform_3_f32(u("u_grid").as_ref(), f.grid[0], f.grid[1], f.grid[2]);
             gl.uniform_1_f32(u("u_gridmix").as_ref(), f.grid_mix);
+            gl.uniform_1_f32(u("u_coast").as_ref(), f.coast);
             gl.uniform_1_f32(u("u_edge").as_ref(), f.edge_darken);
 
             gl.bind_vertex_array(Some(self.vao));
@@ -395,6 +453,9 @@ impl Globe {
                 gl.delete_texture(t);
             }
             if let Some(t) = self.surface {
+                gl.delete_texture(t);
+            }
+            if let Some(t) = self.lights {
                 gl.delete_texture(t);
             }
         }
@@ -442,12 +503,17 @@ unsafe fn compile(gl: &glow::Context) -> Result<glow::Program, String> {
         uniform vec3 u_land;
         uniform vec3 u_grid;
         uniform float u_gridmix;
+        uniform float u_coast;
         uniform float u_edge;
         uniform sampler2D u_mask;
         uniform float u_have_mask;
         uniform sampler2D u_surface;
         uniform float u_have_surface;
         uniform float u_surface_mix;
+        uniform float u_relief;
+        uniform sampler2D u_lights;
+        uniform float u_have_lights;
+        uniform float u_city;
         out vec4 frag;
 
         const float PI = 3.14159265;
@@ -469,10 +535,37 @@ unsafe fn compile(gl: &glow::Context) -> Result<glow::Program, String> {
             vec3 mapped_land = u_land;
             if (u_have_surface > 0.5) {
                 vec3 terrain = texture(u_surface, uv).rgb;
+                // 白天：混入真实地形颜色
                 mapped_land = mix(u_land, terrain, u_surface_mix);
+                // 夜间：不上色，只用地形明暗给月光陆地一点起伏 ——
+                // 低处偏黑、高处/粗糙处偏亮，避免大片纯灰单调
+                if (u_relief > 0.001) {
+                    float tl = dot(terrain, vec3(0.299, 0.587, 0.114));
+                    float f = 0.30 + 1.25 * tl;   // 明暗范围
+                    mapped_land = u_land * mix(1.0, f, u_relief);
+                }
             }
             vec3 base = mix(water, mapped_land, landf);
             vec3 col = base * shade;
+
+            // 白色海岸线：遮罩值穿过 0.5 的那条窄带，用 fwidth 做抗锯齿
+            if (u_have_mask > 0.5 && u_coast > 0.001) {
+                float m = texture(u_mask, uv).r;
+                float cw = fwidth(m) * 1.4;
+                float coast = 1.0 - smoothstep(0.0, max(cw, 1e-4), abs(m - 0.5));
+                coast *= clamp(N.z, 0.0, 1.0);        // 掠射角处压掉
+                coast *= 0.4 + 0.6 * lambert;         // 受光面更亮
+                col = mix(col, vec3(0.96, 0.98, 1.0), coast * u_coast);
+            }
+
+            // 城市灯光：人口密集处的金色亮点，叠一层柔和辉光
+            if (u_have_lights > 0.5 && u_city > 0.001) {
+                float lp = texture(u_lights, uv).r;
+                float lg = textureLod(u_lights, uv, 4.0).r;   // 模糊层做辉光
+                float lit = smoothstep(0.05, 0.5, lp) + 0.7 * smoothstep(0.02, 0.45, lg);
+                vec3 gold = vec3(1.0, 0.80, 0.45);
+                col += gold * lit * u_city * clamp(N.z, 0.0, 1.0);
+            }
 
             // 程序化经纬网：每 15 度一条线
             float lat = degrees(asin(clamp(v_model.y, -1.0, 1.0)));
