@@ -54,10 +54,24 @@ impl Node {
     }
 }
 
+/// 从调用方给出的 `(a, b)` 视角描述链接方向。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkDirection {
+    /// 只有 a -> b。
+    Forward,
+    /// 只有 b -> a。
+    Reverse,
+    /// a -> b 与 b -> a 同时存在。
+    Bidirectional,
+}
+
 #[derive(Default)]
 pub struct Graph {
     pub nodes: Vec<Node>,
+    /// 用于布局和邻居查询的无向边，两端按节点下标升序存放。
     pub edges: Vec<(u32, u32)>,
+    /// 笔记中实际写出的有向链接 `(source, target)`，已排序去重。
+    directed_edges: Vec<(u32, u32)>,
     /// 全库出现过的所有周，升序。节点里的 weeks 存的是这里的下标。
     pub weeks: Vec<Week>,
     /// 全库出现过的所有标签（除去 modified/*），升序去重。
@@ -71,6 +85,17 @@ pub struct Graph {
 impl Graph {
     pub fn find(&self, name: &str) -> Option<u32> {
         self.by_name.get(&name.to_lowercase()).copied()
+    }
+
+    pub fn link_direction(&self, a: u32, b: u32) -> Option<LinkDirection> {
+        let forward = self.directed_edges.binary_search(&(a, b)).is_ok();
+        let reverse = self.directed_edges.binary_search(&(b, a)).is_ok();
+        match (forward, reverse) {
+            (true, true) => Some(LinkDirection::Bidirectional),
+            (true, false) => Some(LinkDirection::Forward),
+            (false, true) => Some(LinkDirection::Reverse),
+            (false, false) => None,
+        }
     }
 
     pub fn load(root: &Path) -> Result<Graph, String> {
@@ -156,20 +181,27 @@ impl Graph {
             .collect();
 
         let mut dangling = 0usize;
-        let mut edges: Vec<(u32, u32)> = Vec::new();
+        let mut directed_edges: Vec<(u32, u32)> = Vec::new();
         for (i, p) in parsed.iter().enumerate() {
             let a = i as u32;
             for link in &p.links {
                 match by_name.get(&link.to_lowercase()) {
                     Some(&b) if b != a => {
-                        // 统一方向后去重，得到无向边
-                        edges.push((a.min(b), a.max(b)));
+                        directed_edges.push((a, b));
                     }
                     Some(_) => {}
                     None => dangling += 1,
                 }
             }
         }
+        directed_edges.sort_unstable();
+        directed_edges.dedup();
+
+        // 布局和连通分量仍按无向图计算；方向只影响连线的视觉表达。
+        let mut edges: Vec<(u32, u32)> = directed_edges
+            .iter()
+            .map(|&(a, b)| (a.min(b), a.max(b)))
+            .collect();
         edges.sort_unstable();
         edges.dedup();
 
@@ -181,6 +213,7 @@ impl Graph {
         let mut graph = Graph {
             nodes,
             edges,
+            directed_edges,
             weeks: all_weeks,
             tags: all_tags,
             by_name,
@@ -368,6 +401,22 @@ mod tests {
     }
 
     #[test]
+    fn graph_preserves_single_and_bidirectional_links() {
+        let graph = Graph {
+            directed_edges: vec![(0, 1), (1, 0), (1, 2)],
+            ..Graph::default()
+        };
+
+        assert_eq!(
+            graph.link_direction(0, 1),
+            Some(LinkDirection::Bidirectional)
+        );
+        assert_eq!(graph.link_direction(1, 2), Some(LinkDirection::Forward));
+        assert_eq!(graph.link_direction(2, 1), Some(LinkDirection::Reverse));
+        assert_eq!(graph.link_direction(0, 2), None);
+    }
+
+    #[test]
     fn parses_tags_and_drops_modified() {
         let text = "---\naliases: []\ntags:\n  - academic\n  - modified/2025-W52\n  - Paper\n  - modified/2026-W01\n---\nbody\n";
         let p = parse_one("Academic".into(), PathBuf::new(), text);
@@ -397,6 +446,10 @@ mod tests {
         let b = g.find("B").unwrap() as usize;
         assert!(g.nodes[a].tags.contains(&acad));
         assert!(!g.nodes[b].tags.contains(&acad));
+        assert_eq!(
+            g.link_direction(a as u32, b as u32),
+            Some(LinkDirection::Forward)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

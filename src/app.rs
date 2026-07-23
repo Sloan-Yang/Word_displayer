@@ -7,7 +7,7 @@ use egui::{
 
 use crate::hotkey;
 use crate::layout::{self, Sim};
-use crate::vocab::{Graph, Week};
+use crate::vocab::{Graph, LinkDirection, Week};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Theme {
@@ -133,6 +133,8 @@ struct Palette {
     text_strong: Color32,
     text_weak: Color32,
     accent: Color32,
+    /// 双向链接的第二股流，用冷色和主强调色拉开方向差异。
+    flow_secondary: Color32,
     tip_bg: Color32,
     tip_border: Color32,
     /// 词团色往这个颜色混，调出气泡的填充；亮色主题混白，暗色主题混黑
@@ -164,6 +166,7 @@ impl Palette {
                 text_strong: Color32::from_rgb(0x25, 0x2A, 0x34),
                 text_weak: Color32::from_rgb(0x73, 0x7A, 0x86),
                 accent: Color32::from_rgb(0xE6, 0x8A, 0x2A),
+                flow_secondary: Color32::from_rgb(0x24, 0x9F, 0xA2),
                 tip_bg: Color32::from_rgba_unmultiplied(255, 255, 255, 246),
                 tip_border: Color32::from_rgb(0xDD, 0xE1, 0xE7),
                 chip_base: Color32::WHITE,
@@ -183,6 +186,7 @@ impl Palette {
                 text_strong: Color32::from_rgb(0xE8, 0xEB, 0xF0),
                 text_weak: Color32::from_rgb(0x8A, 0x92, 0x9E),
                 accent: Color32::from_rgb(0xF0, 0xA9, 0x4C),
+                flow_secondary: Color32::from_rgb(0x65, 0xD2, 0xD0),
                 tip_bg: Color32::from_rgba_unmultiplied(0x2A, 0x2D, 0x34, 246),
                 tip_border: Color32::from_rgb(0x3C, 0x40, 0x48),
                 chip_base: Color32::from_rgb(0x1E, 0x20, 0x25),
@@ -828,6 +832,7 @@ impl eframe::App for App {
         if !self.sim.is_settled()
             || self.auto_fit
             || self.drifting
+            || self.hovered.is_some()
             || self.monitor_snap_frames > 0
         {
             // 排一个定时重绘而不是「立刻」，否则会以显卡能跑多快就跑多快的
@@ -1772,6 +1777,7 @@ impl App {
         // 选中优先于悬停，这样点定一个词之后，鼠标扫过别处也不会打断阅读
         let focus_node = self.selected.or(self.hovered);
         let focus_local = focus_node.and_then(|g| self.sim.local.get(&g).copied());
+        let hover_local = self.hovered.and_then(|g| self.sim.local.get(&g).copied());
         let mut related: HashSet<usize> = HashSet::new();
         if let Some(h) = focus_local {
             related.insert(h);
@@ -1787,6 +1793,7 @@ impl App {
         // ---- 画边（先画，节点会盖住端点，看起来就是连到胶囊边上）----
         let mut shapes: Vec<Shape> = Vec::with_capacity(self.sim.edges.len());
         let base_edge = pal.edge_base.gamma_multiply(self.edge_alpha as f32 / 100.0);
+        let pulse_time = ui.input(|i| i.time);
         for &(a, b) in &self.sim.edges {
             let (a, b) = (a as usize, b as usize);
             let pa = self.to_screen(center, self.sim.pos[a]);
@@ -1808,14 +1815,50 @@ impl App {
             let mid = pa + (pb - pa) * 0.5;
             let perp = Vec2::new(-(pb.y - pa.y), pb.x - pa.x).normalized();
             let ctrl = mid + perp * ((pb - pa).length() * 0.08);
+            let curve = [pa, ctrl, pb];
             shapes.push(Shape::QuadraticBezier(
                 egui::epaint::QuadraticBezierShape::from_points_stroke(
-                    [pa, ctrl, pb],
+                    curve,
                     false,
                     Color32::TRANSPARENT,
                     Stroke::new(width, color),
                 ),
             ));
+
+            if hover_local.is_some_and(|h| h == a || h == b) {
+                let ga = self.sim.ids[a];
+                let gb = self.sim.ids[b];
+                let phase = (pulse_time * 0.34 + f64::from(edge_phase(ga, gb))).fract() as f32;
+                match self.graph.link_direction(ga, gb) {
+                    Some(LinkDirection::Forward) => {
+                        add_pulse_train(&mut shapes, curve, phase, 1.0, 0.0, pal.accent);
+                    }
+                    Some(LinkDirection::Reverse) => {
+                        add_pulse_train(&mut shapes, curve, phase, -1.0, 0.0, pal.accent);
+                    }
+                    Some(LinkDirection::Bidirectional) => {
+                        add_pulse_train(&mut shapes, curve, phase, 1.0, 2.2, pal.accent);
+                        add_pulse_train(&mut shapes, curve, phase, -1.0, -2.2, pal.flow_secondary);
+
+                        // 两股流交汇时在中点形成一次柔和扩散，和单向脉冲明显区分。
+                        let breathe = ((pulse_time * 2.4
+                            + f64::from(edge_phase(gb, ga)) * 5.0)
+                            .sin()
+                            * 0.5
+                            + 0.5) as f32;
+                        let center = quadratic_point(curve, 0.5);
+                        shapes.push(Shape::circle_stroke(
+                            center,
+                            3.5 + breathe * 3.5,
+                            Stroke::new(
+                                1.0,
+                                pal.flow_secondary.gamma_multiply(0.18 + breathe * 0.30),
+                            ),
+                        ));
+                    }
+                    None => {}
+                }
+            }
         }
         painter.extend(shapes);
 
@@ -1993,6 +2036,84 @@ fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
 fn segment_visible(rect: Rect, a: Pos2, b: Pos2) -> bool {
     // 粗筛：两端点的包围盒和视口相交即认为可见
     Rect::from_two_pos(a, b).intersects(rect)
+}
+
+fn quadratic_point(curve: [Pos2; 3], t: f32) -> Pos2 {
+    let ab = curve[0] + (curve[1] - curve[0]) * t;
+    let bc = curve[1] + (curve[2] - curve[1]) * t;
+    ab + (bc - ab) * t
+}
+
+fn quadratic_normal(curve: [Pos2; 3], t: f32) -> Vec2 {
+    let tangent =
+        (curve[1] - curve[0]) * (2.0 * (1.0 - t)) + (curve[2] - curve[1]) * (2.0 * t);
+    if tangent.length_sq() < 1e-6 {
+        return Vec2::ZERO;
+    }
+    Vec2::new(-tangent.y, tangent.x).normalized()
+}
+
+fn edge_phase(a: u32, b: u32) -> f32 {
+    let mut hash = a.wrapping_mul(0x9E37_79B9) ^ b.wrapping_mul(0x85EB_CA6B);
+    hash ^= hash >> 16;
+    (hash & 0xFFFF) as f32 / 65_536.0
+}
+
+fn endpoint_fade(t: f32) -> f32 {
+    let smooth = |x: f32| {
+        let x = x.clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    };
+    smooth(t / 0.10) * smooth((1.0 - t) / 0.10)
+}
+
+/// 沿曲线画三颗带尾迹的脉冲。`direction` 为 1 时从 0 到 1，-1 时反向；
+/// `lane` 让双向流分居曲线两侧，不会重叠成一股看不清方向。
+fn add_pulse_train(
+    shapes: &mut Vec<Shape>,
+    curve: [Pos2; 3],
+    phase: f32,
+    direction: f32,
+    lane: f32,
+    color: Color32,
+) {
+    const PULSES: usize = 3;
+    const TAIL: usize = 4;
+
+    for pulse in 0..PULSES {
+        let progress = (phase + pulse as f32 / PULSES as f32).fract();
+        let head = if direction > 0.0 {
+            progress
+        } else {
+            1.0 - progress
+        };
+
+        // 尾巴先画、亮点后画，层次才不会倒过来。
+        for trail in (0..=TAIL).rev() {
+            let t = head - direction * trail as f32 * 0.022;
+            if !(0.0..=1.0).contains(&t) {
+                continue;
+            }
+            let fade = endpoint_fade(t) * (1.0 - trail as f32 / (TAIL + 1) as f32);
+            if fade <= 0.01 {
+                continue;
+            }
+            let point = quadratic_point(curve, t) + quadratic_normal(curve, t) * lane;
+            let radius = 3.2 - trail as f32 * 0.42;
+            if trail == 0 {
+                shapes.push(Shape::circle_filled(
+                    point,
+                    radius + 4.2,
+                    color.gamma_multiply(fade * 0.16),
+                ));
+            }
+            shapes.push(Shape::circle_filled(
+                point,
+                radius,
+                color.gamma_multiply(fade * 0.92),
+            ));
+        }
+    }
 }
 
 /// 把颜色往背景色混，`t` 越大越接近背景。暗底往黑混、亮底往白混，

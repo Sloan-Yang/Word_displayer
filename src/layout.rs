@@ -21,21 +21,24 @@ const MAX_DEPTH: u32 = 24;
 const K: f32 = 62.0;
 
 // ---- 气泡漂浮的参数 ----
-/// 力导向力在漂浮时的增益。图已经在平衡点附近，这个值只需把它按住，
-/// 不必很大；太大就会抢过游走、看起来在抽动。
-const FORCE_GAIN: f32 = 26.0;
-/// 游走加速度。有斥力维持结构之后，游走只是点缀，给得很小
-const WANDER_ACCEL: f32 = 9.0;
+/// 力导向力在漂浮时的增益。图已经在平衡点附近，只需缓慢拉回结构。
+const FORCE_GAIN: f32 = 14.0;
+/// 力场低通响应速度。Barnes-Hut 树在边界附近会产生细小跳变，不能直接喂给速度。
+const FORCE_RESPONSE: f32 = 2.4;
+/// 游走加速度。有斥力维持结构之后，游走只提供很轻的惯性漂移。
+const WANDER_ACCEL: f32 = 3.2;
 /// 速度衰减，按 60fps 每帧计；实际会按 dt 换算，换帧率不影响手感
-const DAMPING: f32 = 0.90;
+const DAMPING: f32 = 0.94;
 /// 限速，世界单位/秒。K 是 62，所以横穿一条边要七八秒
-const MAX_SPEED: f32 = 9.0;
+const MAX_SPEED: f32 = 7.0;
 /// 斥力倍率。碰撞已经保证不重叠了，斥力只用来把团摊开，所以压得比较低
 const REPULSION: f32 = 0.35;
-/// 碰撞恢复系数，1 是完全弹性
-const RESTITUTION: f32 = 0.55;
 /// 气泡之间留一点缝，看起来不至于糊在一起
 const COLLIDE_PAD: f32 = 3.0;
+/// 允许极小的接触误差，避免浮点误差让两个静止节点逐帧来回修正。
+const COLLISION_SLOP: f32 = 0.12;
+/// 每次只修正大部分穿透，连续两轮约束比一次硬弹开更平滑。
+const COLLISION_CORRECTION: f32 = 0.82;
 
 /// 一个节点在世界坐标里实际占的地方 —— 圆 **加上** 它底下那行单词。
 /// 碰撞按这个包围盒算，所以两个单词的字母永远不会叠在一起。
@@ -82,6 +85,8 @@ pub struct Sim {
 
     // ---- 布局收敛之后的气泡漂浮 ----
     vel: Vec<Vec2>,
+    /// 低通后的力场，隔离 Barnes-Hut 近似和接触边界产生的高频变化。
+    force_ema: Vec<Vec2>,
     /// 每个节点当前的游走方向，以及这个方向自转的角速度
     wander: Vec<f32>,
     wander_rate: Vec<f32>,
@@ -136,6 +141,7 @@ impl Sim {
             alpha: 1.0,
             pinned: None,
             vel: vec![Vec2::ZERO; n],
+            force_ema: vec![Vec2::ZERO; n],
             // 相位和转速都散列自下标：各转各的，不会同步成整齐划一的抽动
             wander: (0..n).map(|i| hash01(i as u32) * std::f32::consts::TAU).collect(),
             wander_rate: (0..n)
@@ -166,6 +172,10 @@ impl Sim {
     /// 用户拖动/改动后重新加热，让布局继续收敛。
     pub fn reheat(&mut self, amount: f32) {
         self.alpha = self.alpha.max(amount);
+        for velocity in &mut self.vel {
+            *velocity *= 0.2;
+        }
+        self.force_ema.fill(Vec2::ZERO);
     }
 
     /// 把力导向的三种力（斥力 + 边引力 + 槽位约束）累加到 `self.disp`。
@@ -224,9 +234,6 @@ impl Sim {
         }
         self.accumulate_forces();
 
-        // 布局阶段也分开一次，这样即使关掉漂浮，标签也不会叠着
-        self.resolve_collisions();
-
         // --- 限幅位移并降温 ---
         let temp = self.alpha * K * 0.7;
         for i in 0..n {
@@ -239,6 +246,11 @@ impl Sim {
                 self.pos[i] += d / len * len.min(temp);
             }
         }
+
+        // 位移完成后再解碰撞，不能拿旧位置算完碰撞又把节点推回重叠区。
+        for _ in 0..2 {
+            self.resolve_collisions(false);
+        }
         self.alpha *= 0.985;
         if self.alpha < 0.005 {
             self.alpha = 0.0;
@@ -249,7 +261,7 @@ impl Sim {
     ///
     /// 和之前渲染时加正弦偏移的做法完全不同：这里是真的在积分速度。
     /// 每个节点有一个缓慢转向的游走方向（转一圈要十几秒），配上较重的阻尼，
-    /// 于是它是在「滑」而不是在「抖」；两个节点的圆碰上了才互相弹开。
+    /// 于是它是在「滑」而不是在「抖」；两个节点接触时会消掉相向速度。
     pub fn drift_step(&mut self, dt: f32) {
         let n = self.pos.len();
         if n == 0 || self.drift <= 0.0 {
@@ -260,16 +272,18 @@ impl Sim {
         // 缺了斥力就是之前塌成一团的病根，所以这里必须一起算。
         self.accumulate_forces();
 
+        let force_blend = 1.0 - (-FORCE_RESPONSE * dt).exp();
         for i in 0..n {
-            // 力导向力作为加速度：图已经在平衡点附近，这只是把它稳稳按住
-            self.vel[i] += self.disp[i] * (FORCE_GAIN * dt);
+            // 先把力场低通，再作为加速度。树结构或碰撞边界的一帧跳变不会直接
+            // 反映到节点位置上，慢变化的结构恢复力仍然完整保留。
+            let smoothed_force = self.force_ema[i];
+            self.force_ema[i] += (self.disp[i] - smoothed_force) * force_blend;
+            self.vel[i] += self.force_ema[i] * (FORCE_GAIN * dt);
 
             // 游走：方向缓慢转动，给一点有机的漂移感，幅度很小别盖过结构
             self.wander[i] += self.wander_rate[i] * dt;
             self.vel[i] += Vec2::angled(self.wander[i]) * (WANDER_ACCEL * self.drift * dt);
         }
-
-        self.resolve_collisions();
 
         // --- 积分：阻尼 + 限速，保证是慢悠悠地飘 ---
         // 阻尼是「每帧」的量，按 dt 折算成等效衰减，30fps 和 60fps 手感一致
@@ -277,6 +291,7 @@ impl Sim {
         for i in 0..n {
             if Some(i) == self.pinned {
                 self.vel[i] = Vec2::ZERO;
+                self.force_ema[i] = Vec2::ZERO;
                 continue;
             }
             self.vel[i] *= damping;
@@ -286,6 +301,11 @@ impl Sim {
                 self.vel[i] *= cap / speed;
             }
             self.pos[i] += self.vel[i] * dt;
+        }
+
+        // 先完成本帧运动，再处理接触。接触只消掉相向速度，不产生反弹。
+        for _ in 0..2 {
+            self.resolve_collisions(true);
         }
     }
 
@@ -304,9 +324,9 @@ impl Sim {
     /// 气泡碰撞。
     ///
     /// 碰的是「圆 + 底下那行单词」的包围盒，不是光秃秃的圆 —— 所以两个单词的
-    /// 字母一旦要压到一起，节点就会先被弹开，永远轮不到「谁的标签让位」。
+    /// 字母一旦要压到一起，节点就会先被分开，永远轮不到「谁的标签让位」。
     /// 用均匀网格做邻域查询，不然节点一多就退化成两两比较。
-    fn resolve_collisions(&mut self) {
+    fn resolve_collisions(&mut self, affect_velocity: bool) {
         let n = self.pos.len();
         if n < 2 {
             return;
@@ -331,7 +351,7 @@ impl Sim {
                     let Some(bucket) = grid.get(&(gx, gy)) else {
                         continue;
                     };
-                    for jj in bucket.clone() {
+                    for &jj in bucket {
                         let j = jj as usize;
                         if j <= i {
                             continue;
@@ -345,28 +365,49 @@ impl Sim {
                             continue; // 盒子没相交
                         }
 
-                        // 沿「插得最浅」的那根轴分开，位移最小、看着最自然
-                        let (normal, depth) = if over_x < over_y {
-                            (Vec2::new(if delta.x < 0.0 { -1.0 } else { 1.0 }, 0.0), over_x)
+                        // 深度非常接近时固定选择一根轴，避免 x/y 法线逐帧翻转。
+                        let prefer_x = ((i as u32).wrapping_mul(0x9E37_79B9) ^ j as u32) & 1 == 0;
+                        let use_x = if (over_x - over_y).abs() < 1.0 {
+                            prefer_x
                         } else {
-                            (Vec2::new(0.0, if delta.y < 0.0 { -1.0 } else { 1.0 }), over_y)
+                            over_x < over_y
+                        };
+                        let (normal, depth) = if use_x {
+                            (
+                                Vec2::new(if delta.x < 0.0 { -1.0 } else { 1.0 }, 0.0),
+                                over_x,
+                            )
+                        } else {
+                            (
+                                Vec2::new(0.0, if delta.y < 0.0 { -1.0 } else { 1.0 }),
+                                over_y,
+                            )
                         };
 
-                        // 先把重叠推开，避免一直穿透着抖
-                        let push = normal * (depth * 0.5);
-                        if Some(i) != self.pinned {
-                            self.pos[i] -= push;
-                        }
-                        if Some(j) != self.pinned {
-                            self.pos[j] += push;
+                        let movable_i = (Some(i) != self.pinned) as u8 as f32;
+                        let movable_j = (Some(j) != self.pinned) as u8 as f32;
+                        let movable = movable_i + movable_j;
+                        if movable <= 0.0 {
+                            continue;
                         }
 
-                        // 只在互相靠近时反弹，分开中的不要再踹一脚
+                        // 留一点亚像素容差并渐进修正；钉住一端时由另一端承担全部位移。
+                        let correction =
+                            normal * ((depth - COLLISION_SLOP).max(0.0) * COLLISION_CORRECTION);
+                        self.pos[i] -= correction * (movable_i / movable);
+                        self.pos[j] += correction * (movable_j / movable);
+
+                        if !affect_velocity {
+                            continue;
+                        }
+
+                        // 只消掉相向的法线速度，不反弹。可视化节点不是弹珠，
+                        // 零恢复系数能让接触自然停稳，也不会下一帧再次撞回来。
                         let approach = (self.vel[j] - self.vel[i]).dot(normal);
                         if approach < 0.0 {
-                            let imp = normal * (-(1.0 + RESTITUTION) * approach * 0.5);
-                            self.vel[i] -= imp;
-                            self.vel[j] += imp;
+                            let impulse = normal * (-approach / movable);
+                            self.vel[i] -= impulse * movable_i;
+                            self.vel[j] += impulse * movable_j;
                         }
                     }
                 }
@@ -702,6 +743,59 @@ mod tests {
         sim.drift_step(1.0 / 60.0);
         let after = (sim.pos[1] - sim.pos[0]).length();
         assert!(after > before, "重叠的气泡没有被推开: {before} -> {after}");
+    }
+
+    /// 接触只应阻止继续靠近，不能产生下一帧撞回来的反弹速度。
+    #[test]
+    fn collision_contact_does_not_bounce() {
+        let mut sim = Sim::new(vec![0, 1], Vec::new(), fake_extents(2));
+        sim.pos[0] = Pos2::new(0.0, 0.0);
+        sim.pos[1] = Pos2::new(30.0, 0.0);
+        sim.vel[0] = Vec2::new(5.0, 0.0);
+        sim.vel[1] = Vec2::new(-5.0, 0.0);
+
+        sim.resolve_collisions(true);
+
+        let relative_speed = (sim.vel[1] - sim.vel[0]).x;
+        assert!(
+            relative_speed.abs() < 1e-4,
+            "接触后仍有反弹或穿透速度: {relative_speed}"
+        );
+    }
+
+    /// 漂移可以缓慢转向，但不能连续帧来回翻转方向形成视觉抖动。
+    #[test]
+    fn drift_has_no_high_frequency_direction_flips() {
+        let ids: Vec<u32> = (0..14).collect();
+        let edges: Vec<(u32, u32)> = (1..14).map(|i| (0, i)).collect();
+        let mut sim = Sim::new(ids, edges, fake_extents(14));
+        while !sim.is_settled() {
+            sim.step();
+        }
+
+        let mut previous = vec![Vec2::ZERO; sim.len()];
+        let mut reversals = 0usize;
+        let mut moving_samples = 0usize;
+        for _ in 0..900 {
+            let before = sim.pos.clone();
+            sim.drift_step(1.0 / 60.0);
+            for i in 0..sim.len() {
+                let delta = sim.pos[i] - before[i];
+                let product = delta.length() * previous[i].length();
+                if product > 1e-6 {
+                    moving_samples += 1;
+                    if delta.dot(previous[i]) < product * -0.5 {
+                        reversals += 1;
+                    }
+                }
+                previous[i] = delta;
+            }
+        }
+
+        assert!(
+            reversals * 200 < moving_samples.max(1),
+            "连续帧方向反转过多: {reversals} / {moving_samples}"
+        );
     }
 
     /// 漂浮再久也不该飘出自己的槽位，否则词团之间会串味。
