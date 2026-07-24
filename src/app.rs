@@ -107,6 +107,14 @@ const MIN_WINDOW: egui::Vec2 = egui::vec2(420.0, 320.0);
 /// Windows 的 Win+Shift+方向键跨屏移动会经历几帧过渡态；延后并重试归位。
 const MONITOR_SWITCH_SNAP_FRAMES: u32 = 12;
 
+/// 主修饰键在界面提示里怎么写。快捷键本身走 egui 的 `modifiers.command`，
+/// 它已经把 Windows/Linux 的 Ctrl 和 macOS 的 ⌘ 映射好了；这里只是让屏幕上
+/// 的提示文字跟着平台走，别在 mac 上还写「Ctrl」误导用户。
+#[cfg(target_os = "macos")]
+const CMD: &str = "⌘";
+#[cfg(not(target_os = "macos"))]
+const CMD: &str = "Ctrl";
+
 /// 重新读取词库后，周列表可能因为新增/删除笔记而改变下标。
 /// 按周标签重新定位旧范围，不能直接复用下标，也不能重置成最近四周。
 fn remap_week_range(
@@ -1156,14 +1164,16 @@ impl App {
 
                         ui.add_space(8.0);
                         if self.hotkey_registered {
-                            ui.weak("Ctrl+9 收进后台 · Ctrl+B 收起本卡");
+                            ui.weak(format!("{CMD}+9 收进后台 · {CMD}+B 收起本卡"));
                         } else {
-                            ui.weak("Ctrl+9 被占用，只在窗口内生效");
+                            ui.weak(format!("{CMD}+9 被占用，只在窗口内生效"));
                         }
-                        ui.weak("Ctrl+F 搜索 · F5 刷新 · Esc 关详情 · Ctrl+Shift+←/→ 切库");
+                        ui.weak(format!(
+                            "{CMD}+F 搜索 · F5 刷新 · Esc 关详情 · {CMD}+Shift+←/→ 切库"
+                        ));
                         ui.weak("F 复位视野 · F11 全屏 · 方向键平移");
                         ui.weak("+/− 缩放 · 按住 Shift 加速");
-                        ui.weak("Ctrl+N 窗口归位（多屏拖乱了用它）");
+                        ui.weak(format!("{CMD}+N 窗口归位（多屏拖乱了用它）"));
                         ui.weak("拖本卡空白处可移动窗口");
 
                         if let Some(tex) = &self.sidebar_backdrop {
@@ -1376,7 +1386,7 @@ impl App {
     fn search_controls(&mut self, ui: &mut egui::Ui) {
         let resp = ui.add(
             egui::TextEdit::singleline(&mut self.search)
-                .hint_text("搜索，回车定位  (Ctrl+F)")
+                .hint_text(format!("搜索，回车定位  ({CMD}+F)"))
                 .desired_width(f32::INFINITY),
         );
         if self.focus_search {
