@@ -443,6 +443,15 @@ mod imp {
 
         rx.recv().unwrap_or(false)
     }
+
+    /// 当前本地时间的小时（0–23），用来做白天/黑夜主题自动切换。
+    pub fn local_hour() -> u32 {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe { GetLocalTime(&mut st) };
+        st.wHour as u32
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -667,6 +676,22 @@ mod imp {
         }
     }
 
+    /// 当前本地时间的小时（0–23），用来做白天/黑夜主题自动切换。
+    ///
+    /// 走 libc 的 `localtime_r`，它会按系统时区把 UTC 换算成本地时间 ——
+    /// 不能像其它平台的兜底那样直接用 UTC 小时，否则主题会按错误的时刻切换。
+    pub fn local_hour() -> u32 {
+        // SAFETY: 标准 C 时间调用；tm 全零初始化，localtime_r 只写我们栈上这份。
+        unsafe {
+            let t = libc::time(std::ptr::null_mut());
+            let mut tm: libc::tm = std::mem::zeroed();
+            if libc::localtime_r(&t, &mut tm).is_null() {
+                return 0;
+            }
+            tm.tm_hour.rem_euclid(24) as u32
+        }
+    }
+
     /// Carbon / HIToolbox 里注册全局热键要用到的一小撮 FFI 声明。
     mod carbon {
         use std::ffi::c_void;
@@ -732,6 +757,16 @@ mod imp {
     pub fn spawn(_ctx: egui::Context, _signal: super::Signal) -> bool {
         false // 其它平台暂时只有窗口内的 Ctrl+9
     }
+
+    /// 没有本地时区 API 就用 UTC 小时兜底。
+    pub fn local_hour() -> u32 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ((secs / 3600) % 24) as u32
+    }
     pub fn is_visible() -> bool {
         true
     }
@@ -757,5 +792,5 @@ mod imp {
 
 pub use imp::{
     apply_window_shape, current_monitor_id, current_monitor_id_away_from, hide, is_visible,
-    restore_size, snap_top_center, snap_top_center_on, spawn,
+    local_hour, restore_size, snap_top_center, snap_top_center_on, spawn,
 };

@@ -1,4 +1,6 @@
+# Rust build output
 /target
 
-# macOS
+# Editor / OS cruft
 .DS_Store
+*.swp

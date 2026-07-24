@@ -22,6 +22,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_Threading",
+    "Win32_System_SystemInformation",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -45,6 +46,8 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 # 全局热键 Cmd+9 走 Carbon 的 RegisterEventHotKey（无需辅助功能权限），
 # 通过 #[link] 直接链接 Carbon framework，不再单列依赖。
+# localtime_r：按系统时区取本地小时，给日/夜主题自动切换用。
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

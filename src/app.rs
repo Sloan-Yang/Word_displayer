@@ -1,16 +1,27 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use egui::{
     Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Vec2,
 };
 
+use crate::globe::{self, Globe};
 use crate::hotkey;
 use crate::layout::{self, Sim};
+use crate::reading::{Book, ReadingMap};
 use crate::vocab::{Graph, LinkDirection, Week};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Theme {
+    Light,
+    Dark,
+}
+
+/// 主题模式。自动模式按本地时间在白天/黑夜之间切换。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeMode {
+    Auto,
     Light,
     Dark,
 }
@@ -22,6 +33,15 @@ enum NodeShape {
     Circle,
 }
 
+/// 库的可视化类型。平面词图，还是三维阅读地球。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LibKind {
+    /// 平面力导向词图（单词 / 笔记）。
+    Graph,
+    /// 三维地球（阅读地图）。
+    Globe,
+}
+
 /// 标签在筛选里的状态：普通不影响；只看=白名单；隐藏=黑名单。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TagState {
@@ -29,12 +49,13 @@ enum TagState {
     Hidden,
 }
 
-/// 一个可视化的库：一个目录 + 一种节点形状。
+/// 一个可视化的库：一个目录 + 一种节点形状 + 可视化类型。
 #[derive(Clone)]
 struct Library {
     name: String,
     path: std::path::PathBuf,
     shape: NodeShape,
+    kind: LibKind,
 }
 
 /// 预置的库。第一个是默认启动的，它的路径要和 `main::default_root()` 一致，
@@ -54,11 +75,20 @@ fn preset_libraries() -> Vec<Library> {
                 name: "单词".into(),
                 path: home.join("WorkSpace/English_words"),
                 shape: NodeShape::Pill,
+                kind: LibKind::Graph,
             },
             Library {
                 name: "笔记".into(),
                 path: home.join("WorkSpace/Obsidian_notes"),
                 shape: NodeShape::Circle,
+                kind: LibKind::Graph,
+            },
+            Library {
+                name: "阅读".into(),
+                // 每本读过的书一个 md，frontmatter 写 author / country（可选 lat/lon）。
+                path: home.join("WorkSpace/Reading"),
+                shape: NodeShape::Circle,
+                kind: LibKind::Globe,
             },
         ]
     }
@@ -69,11 +99,20 @@ fn preset_libraries() -> Vec<Library> {
                 name: "单词".into(),
                 path: r"D:\Code\Vocab".into(),
                 shape: NodeShape::Pill,
+                kind: LibKind::Graph,
             },
             Library {
                 name: "笔记".into(),
                 path: r"D:\Code\Lunarvim_Obsidian".into(),
                 shape: NodeShape::Circle,
+                kind: LibKind::Graph,
+            },
+            Library {
+                name: "阅读".into(),
+                // 每本读过的书一个 md，frontmatter 写 author / country（可选 lat/lon）。
+                path: r"D:\Code\Reading".into(),
+                shape: NodeShape::Circle,
+                kind: LibKind::Globe,
             },
         ]
     }
@@ -104,6 +143,9 @@ const WINDOW_RADIUS: f32 = 34.0;
 const DEFAULT_WINDOW: egui::Vec2 = egui::vec2(1440.0, 900.0);
 /// 小于这个尺寸就认为已经没法操作了
 const MIN_WINDOW: egui::Vec2 = egui::vec2(420.0, 320.0);
+/// 地球首页视角：以中国东部为中心，让东亚正对镜头、中东落到背面。
+const GLOBE_HOME_LAT: f32 = 30.0;
+const GLOBE_HOME_LON: f32 = 118.0;
 /// Windows 的 Win+Shift+方向键跨屏移动会经历几帧过渡态；延后并重试归位。
 const MONITOR_SWITCH_SNAP_FRAMES: u32 = 12;
 
@@ -114,6 +156,12 @@ const MONITOR_SWITCH_SNAP_FRAMES: u32 = 12;
 const CMD: &str = "⌘";
 #[cfg(not(target_os = "macos"))]
 const CMD: &str = "Ctrl";
+
+/// 阅读库示例路径，只用于界面文案，和 `preset_libraries()` 里那一行保持一致。
+#[cfg(target_os = "macos")]
+const READING_DIR_HINT: &str = "~/WorkSpace/Reading";
+#[cfg(not(target_os = "macos"))]
+const READING_DIR_HINT: &str = r"D:\Code\Reading";
 
 /// 重新读取词库后，周列表可能因为新增/删除笔记而改变下标。
 /// 按周标签重新定位旧范围，不能直接复用下标，也不能重置成最近四周。
@@ -282,6 +330,8 @@ pub struct App {
     tiny_frames: u32,
     /// 背景图。解码要用 Context，所以也是首帧才上传
     backdrop: Option<egui::TextureHandle>,
+    /// 暗色主题下的星空背景
+    night_backdrop: Option<egui::TextureHandle>,
     /// 左侧栏的背景图
     sidebar_backdrop: Option<egui::TextureHandle>,
     /// 左侧面板是否展开
@@ -303,10 +353,34 @@ pub struct App {
     /// 当前是哪个预置库；用自定义路径加载后为 None
     current_lib: Option<usize>,
     shape: NodeShape,
+    /// 当前库的可视化类型：平面词图还是三维地球
+    lib_kind: LibKind,
+
+    // 阅读地图（三维地球）
+    reading: ReadingMap,
+    /// 地球的 GL 资源。首帧从 glow 上下文里建；建失败就存下原因
+    globe: Option<Arc<Mutex<Globe>>>,
+    globe_error: Option<String>,
+    /// 自转累计角度，随时间增长
+    spin: f32,
+    /// 是否自动自转
+    auto_spin: bool,
+    spin_speed: f32,
+    /// 轨道相机绕地球的偏航/俯仰角
+    camera_yaw: f32,
+    camera_pitch: f32,
+    /// 地球的画面缩放倍率
+    globe_zoom: f32,
+    /// 选中/悬停的书（`reading.books` 的下标）
+    selected_book: Option<u32>,
+    hovered_book: Option<u32>,
 
     // 外观
     drifting: bool,
     drift_speed: f32,
+    /// 用户选的主题模式（自动 / 亮 / 暗）
+    theme_mode: ThemeMode,
+    /// 当前生效的主题，由 `theme_mode` 每帧解算得到
     theme: Theme,
     /// 已经套用到 egui 上的主题，变了才重新设置样式
     applied_theme: Option<Theme>,
@@ -334,6 +408,25 @@ impl App {
         let shape = current_lib
             .map(|i| libraries[i].shape)
             .unwrap_or(NodeShape::Pill);
+        let lib_kind = current_lib
+            .map(|i| libraries[i].kind)
+            .unwrap_or(LibKind::Graph);
+
+        // 三维地球的 GL 资源要趁现在（拿得到 glow 上下文）建好
+        let (globe, globe_error) = match cc.gl.as_ref() {
+            Some(gl) => match Globe::new(
+                gl,
+                load_earth_mask(),
+                load_earth_surface(),
+                load_earth_lights(),
+            ) {
+                Ok(g) => (Some(Arc::new(Mutex::new(g))), None),
+                Err(e) => (None, Some(e)),
+            },
+            None => (None, Some("没有 OpenGL 上下文，无法绘制地球".to_string())),
+        };
+        let (camera_yaw, camera_pitch) =
+            globe::camera_angles_for(GLOBE_HOME_LAT, GLOBE_HOME_LON, 0.0);
 
         let last = graph.weeks.len().saturating_sub(1);
         let app = App {
@@ -342,12 +435,25 @@ impl App {
             libraries,
             current_lib,
             shape,
+            lib_kind,
+            reading: ReadingMap::default(),
+            globe,
+            globe_error,
+            spin: 0.0,
+            auto_spin: true,
+            spin_speed: 1.0,
+            camera_yaw,
+            camera_pitch,
+            globe_zoom: 1.0,
+            selected_book: None,
+            hovered_book: None,
             root_input: root.to_string_lossy().to_string(),
-            week_lo: last.saturating_sub(3),
+            // 默认只看最近一周，且显示这一周的所有词（含没有链接的），
+            // 配合 Q/E 一周一周地复习
+            week_lo: last,
             week_hi: last,
             hops: 1,
-            // 库里绝大多数词没有链接，默认藏掉，先看成团的部分
-            hide_isolated: true,
+            hide_isolated: false,
             focus: None,
             graph,
             load_error,
@@ -369,11 +475,13 @@ impl App {
             monitor_snap_frames: 0,
             tiny_frames: 0,
             backdrop: None,
+            night_backdrop: None,
             sidebar_backdrop: None,
             show_sidebar: true,
             focus_search: false,
             drifting: true,
             drift_speed: 1.0,
+            theme_mode: ThemeMode::Auto,
             theme: Theme::Light,
             applied_theme: None,
             edge_alpha: 100,
@@ -381,6 +489,23 @@ impl App {
         };
         // 这里不能 rebuild：字体还没就绪，量不了单词的宽度
         app
+    }
+
+    /// 解算当前该用哪个主题。自动模式按本地时间：白天（7:00–19:00）用亮色，
+    /// 其余时间用暗色星空。
+    fn resolve_theme(&self) -> Theme {
+        match self.theme_mode {
+            ThemeMode::Light => Theme::Light,
+            ThemeMode::Dark => Theme::Dark,
+            ThemeMode::Auto => {
+                let h = hotkey::local_hour();
+                if (7..19).contains(&h) {
+                    Theme::Light
+                } else {
+                    Theme::Dark
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------- 显示 / 隐藏
@@ -544,10 +669,17 @@ impl App {
         };
         self.root_input = lib.path.to_string_lossy().to_string();
         self.shape = lib.shape;
+        self.lib_kind = lib.kind;
         self.current_lib = Some(index);
         self.focus = None;
         self.selected = None;
+        self.selected_book = None;
+        self.hovered_book = None;
         self.reload();
+    }
+
+    fn is_globe(&self) -> bool {
+        self.lib_kind == LibKind::Globe
     }
 
     /// 在库之间循环切换（Ctrl+Shift+←/→）。
@@ -580,6 +712,8 @@ impl App {
             name,
             path,
             shape: self.shape,
+            // 手动添加的都是平面词图库；三维阅读地图只走预置项
+            kind: LibKind::Graph,
         });
         self.switch_library(self.libraries.len() - 1);
     }
@@ -662,6 +796,10 @@ impl App {
     }
 
     fn reload(&mut self) {
+        if self.is_globe() {
+            self.reload_reading();
+            return;
+        }
         let root = PathBuf::from(self.root_input.trim());
         let old_range = (self.week_lo, self.week_hi);
         let old_weeks = self.graph.weeks.clone();
@@ -691,6 +829,26 @@ impl App {
                 self.rebuild();
             }
             Err(e) => self.load_error = Some(e),
+        }
+    }
+
+    /// 加载「阅读地图」库到 `self.reading`。周范围重置成全部。
+    fn reload_reading(&mut self) {
+        let root = PathBuf::from(self.root_input.trim());
+        match ReadingMap::load(&root) {
+            Ok(m) => {
+                let last = m.weeks.len().saturating_sub(1);
+                self.week_lo = 0;
+                self.week_hi = last;
+                self.reading = m;
+                self.load_error = None;
+                self.selected_book = None;
+                self.hovered_book = None;
+            }
+            Err(e) => {
+                self.reading = ReadingMap::default();
+                self.load_error = Some(e);
+            }
         }
     }
 
@@ -780,6 +938,8 @@ impl eframe::App for App {
         }
         self.handle_visibility(ctx);
 
+        // 主题：自动模式按本地时间在白天/黑夜之间切换
+        self.theme = self.resolve_theme();
         if self.applied_theme != Some(self.theme) {
             apply_theme(ctx, self.theme);
             self.applied_theme = Some(self.theme);
@@ -791,8 +951,13 @@ impl eframe::App for App {
 
         if self.pending_rebuild {
             self.pending_rebuild = false;
-            self.rebuild();
+            if self.is_globe() {
+                self.reload_reading();
+            } else {
+                self.rebuild();
+            }
             self.backdrop = load_texture(ctx, "backdrop", BKG_BYTES);
+            self.night_backdrop = load_texture(ctx, "night", NIGHT_BKG_BYTES);
             self.sidebar_backdrop = load_texture(ctx, "sidebar", TAB_BKG_BYTES);
         }
 
@@ -854,15 +1019,27 @@ impl eframe::App for App {
         self.handle_resize(ctx);
 
         // 画布铺满整个圆；控制面板浮在圆里面，不再是从上到下的一条
+        let is_globe = self.is_globe();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ctx, |ui| self.graph_view(ui, &pal));
+            .show(ctx, |ui| {
+                if is_globe {
+                    self.globe_view(ui, &pal);
+                } else {
+                    self.graph_view(ui, &pal);
+                }
+            });
         if self.show_sidebar {
             self.side_panel(ctx, &pal);
         }
-        self.detail_panel(ctx, &pal);
+        if is_globe {
+            self.book_detail_panel(ctx, &pal);
+        } else {
+            self.detail_panel(ctx, &pal);
+        }
 
-        if !self.sim.is_settled()
+        if is_globe
+            || !self.sim.is_settled()
             || self.auto_fit
             || self.drifting
             || self.hovered.is_some()
@@ -871,6 +1048,15 @@ impl eframe::App for App {
             // 排一个定时重绘而不是「立刻」，否则会以显卡能跑多快就跑多快的
             // 速度空转。气泡本来就飘得慢，30fps 完全够看，而且省一半电。
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+    }
+
+    /// 退出时释放地球的 GL 资源。
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let (Some(gl), Some(g)) = (gl, &self.globe) {
+            if let Ok(g) = g.lock() {
+                g.destroy(gl);
+            }
         }
     }
 }
@@ -956,14 +1142,19 @@ impl App {
         let pts = round_rect_points(screen.shrink(0.5), [self.effective_radius(ctx); 4]);
 
         painter.add(Shape::convex_polygon(pts.clone(), pal.panel, Stroke::NONE));
-        if let Some(tex) = &self.backdrop {
-            painter.add(textured_fan(screen, &pts, tex.id(), pal.bg_tint));
-            if pal.bg_veil.a() > 0 {
-                painter.add(Shape::convex_polygon(
-                    pts.clone(),
-                    pal.bg_veil,
-                    Stroke::NONE,
-                ));
+        // 暗色主题铺星空（本身就暗，直接原色显示、不盖薄纱）；亮色用清淡底图
+        let (tex, tint, veil) = match self.theme {
+            Theme::Dark => (
+                self.night_backdrop.as_ref().or(self.backdrop.as_ref()),
+                Color32::WHITE,
+                Color32::TRANSPARENT,
+            ),
+            Theme::Light => (self.backdrop.as_ref(), pal.bg_tint, pal.bg_veil),
+        };
+        if let Some(tex) = tex {
+            painter.add(textured_fan(screen, &pts, tex.id(), tint));
+            if veil.a() > 0 {
+                painter.add(Shape::convex_polygon(pts.clone(), veil, Stroke::NONE));
             }
         }
         painter.add(Shape::closed_line(pts, Stroke::new(1.2, pal.window_border)));
@@ -988,7 +1179,7 @@ impl App {
         if self.show_sidebar {
             r.min.x += self.card_width(ctx) + 14.0;
         }
-        if self.selected.is_some() {
+        if self.selected.is_some() || self.selected_book.is_some() {
             r.max.x -= 230.0_f32.min(r.width() * 0.42) + 14.0;
         }
         if r.width() < 120.0 {
@@ -1142,21 +1333,31 @@ impl App {
                             .show(ui, |ui| {
                                 self.library_controls(ui);
                                 ui.add_space(12.0);
-                                self.time_controls(ui);
-                                ui.add_space(12.0);
-                                self.scope_controls(ui);
-                                ui.add_space(12.0);
-                                self.tag_controls(ui);
-                                ui.add_space(12.0);
-                                self.search_controls(ui);
+                                if self.is_globe() {
+                                    self.reading_controls(ui);
+                                } else {
+                                    self.time_controls(ui);
+                                    ui.add_space(12.0);
+                                    self.scope_controls(ui);
+                                    ui.add_space(12.0);
+                                    self.tag_controls(ui);
+                                    ui.add_space(12.0);
+                                    self.search_controls(ui);
+                                }
                                 ui.add_space(12.0);
                                 ui.horizontal(|ui| {
                                     if ui.button("重置视图").clicked() {
-                                        self.auto_fit = true;
-                                        self.selected = None;
+                                        if self.is_globe() {
+                                            self.reset_globe_camera();
+                                            self.selected_book = None;
+                                        } else {
+                                            self.auto_fit = true;
+                                            self.selected = None;
+                                        }
                                     }
-                                    ui.selectable_value(&mut self.theme, Theme::Light, "亮");
-                                    ui.selectable_value(&mut self.theme, Theme::Dark, "暗");
+                                    ui.selectable_value(&mut self.theme_mode, ThemeMode::Auto, "自动");
+                                    ui.selectable_value(&mut self.theme_mode, ThemeMode::Light, "亮");
+                                    ui.selectable_value(&mut self.theme_mode, ThemeMode::Dark, "暗");
                                 });
                                 ui.add_space(10.0);
                                 self.advanced_controls(ui);
@@ -1171,7 +1372,12 @@ impl App {
                         ui.weak(format!(
                             "{CMD}+F 搜索 · F5 刷新 · Esc 关详情 · {CMD}+Shift+←/→ 切库"
                         ));
-                        ui.weak("F 复位视野 · F11 全屏 · 方向键平移");
+                        ui.weak("Q/E 上一周 / 下一周（整周复习）");
+                        if self.is_globe() {
+                            ui.weak("F 复位视野 · F11 全屏 · 方向键环绕观察");
+                        } else {
+                            ui.weak("F 复位视野 · F11 全屏 · 方向键平移");
+                        }
                         ui.weak("+/− 缩放 · 按住 Shift 加速");
                         ui.weak(format!("{CMD}+N 窗口归位（多屏拖乱了用它）"));
                         ui.weak("拖本卡空白处可移动窗口");
@@ -1403,28 +1609,32 @@ impl App {
         egui::CollapsingHeader::new("高级显示设置")
             .default_open(false)
             .show(ui, |ui| {
-                ui.checkbox(&mut self.drifting, "气泡漂浮");
-                if self.drifting {
-                    ui.add(egui::Slider::new(&mut self.drift_speed, 0.1..=2.5).text("漂浮速度"));
-                }
-                ui.horizontal(|ui| {
-                    ui.label("节点形状");
-                    let mut shape = self.shape;
-                    ui.selectable_value(&mut shape, NodeShape::Pill, "胶囊");
-                    ui.selectable_value(&mut shape, NodeShape::Circle, "圆形");
-                    if shape != self.shape {
-                        self.shape = shape;
+                if !self.is_globe() {
+                    ui.checkbox(&mut self.drifting, "气泡漂浮");
+                    if self.drifting {
+                        ui.add(
+                            egui::Slider::new(&mut self.drift_speed, 0.1..=2.5).text("漂浮速度"),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("节点形状");
+                        let mut shape = self.shape;
+                        ui.selectable_value(&mut shape, NodeShape::Pill, "胶囊");
+                        ui.selectable_value(&mut shape, NodeShape::Circle, "圆形");
+                        if shape != self.shape {
+                            self.shape = shape;
+                            self.rebuild();
+                        }
+                    });
+                    if ui
+                        .add(egui::Slider::new(&mut self.node_scale, 0.5..=2.0).text("节点大小"))
+                        .changed()
+                    {
+                        // 大小变了，碰撞盒也得跟着变，只能重排
                         self.rebuild();
                     }
-                });
-                if ui
-                    .add(egui::Slider::new(&mut self.node_scale, 0.5..=2.0).text("节点大小"))
-                    .changed()
-                {
-                    // 大小变了，碰撞盒也得跟着变，只能重排
-                    self.rebuild();
+                    ui.add(egui::Slider::new(&mut self.edge_alpha, 20..=260).text("连线浓度"));
                 }
-                ui.add(egui::Slider::new(&mut self.edge_alpha, 20..=260).text("连线浓度"));
 
                 ui.add_space(6.0);
                 ui.label(RichText::new("库管理").strong());
@@ -1461,24 +1671,39 @@ impl App {
                 }
 
                 ui.add_space(6.0);
-                ui.weak(format!(
-                    "显示 {} 个词 / {} 条联系 / {} 个词团",
-                    self.sim.len(),
-                    self.sim.edges.len(),
-                    self.sim.component_count()
-                ));
-                let hidden = self.isolated_count();
-                if hidden > 0 {
-                    ui.weak(format!("{hidden} 个没有联系的词被隐藏"));
-                }
-                ui.weak(format!(
-                    "库内共 {} 个词，{} 条联系，{} 周",
-                    self.graph.nodes.len(),
-                    self.graph.edges.len(),
-                    self.graph.weeks.len()
-                ));
-                if self.graph.dangling_links > 0 {
-                    ui.weak(format!("{} 个链接指向不存在的词", self.graph.dangling_links));
+                if self.is_globe() {
+                    ui.weak(format!(
+                        "{} 本书 / {} 位作家 / {} 个国度",
+                        self.reading.books.len(),
+                        self.reading.authors.len(),
+                        self.reading.countries.len()
+                    ));
+                    if self.reading.unplaced > 0 {
+                        ui.weak(format!(
+                            "{} 本书的 country 查不到坐标（可写 lat/lon 覆盖）",
+                            self.reading.unplaced
+                        ));
+                    }
+                } else {
+                    ui.weak(format!(
+                        "显示 {} 个词 / {} 条联系 / {} 个词团",
+                        self.sim.len(),
+                        self.sim.edges.len(),
+                        self.sim.component_count()
+                    ));
+                    let hidden = self.isolated_count();
+                    if hidden > 0 {
+                        ui.weak(format!("{hidden} 个没有联系的词被隐藏"));
+                    }
+                    ui.weak(format!(
+                        "库内共 {} 个词，{} 条联系，{} 周",
+                        self.graph.nodes.len(),
+                        self.graph.edges.len(),
+                        self.graph.weeks.len()
+                    ));
+                    if self.graph.dangling_links > 0 {
+                        ui.weak(format!("{} 个链接指向不存在的词", self.graph.dangling_links));
+                    }
                 }
 
                 ui.add_space(6.0);
@@ -1722,6 +1947,24 @@ impl App {
             if moved {
                 self.auto_fit = false;
                 ui.ctx().request_repaint();
+            }
+
+            // Q/E 一周一周地步进：Q 上一周、E 下一周。每次把时间范围收成
+            // 单独一周，正好用来复习那一周的所有单词。
+            let (prev_week, next_week) =
+                ui.input(|i| (i.key_pressed(egui::Key::Q), i.key_pressed(egui::Key::E)));
+            if (prev_week || next_week) && !self.graph.weeks.is_empty() {
+                let max = self.graph.weeks.len() - 1;
+                let cur = self.week_hi.min(max);
+                let target = if next_week {
+                    (cur + 1).min(max)
+                } else {
+                    cur.saturating_sub(1)
+                };
+                self.week_lo = target;
+                self.week_hi = target;
+                self.focus = None;
+                self.rebuild();
             }
         }
 
@@ -2045,6 +2288,19 @@ impl App {
             painter.galley(anchor, galley, pal.text_weak);
         }
 
+        // ---- 顶部：单周复习时标出现在是哪一周 ----
+        if self.week_lo == self.week_hi {
+            if let Some(w) = self.graph.weeks.get(self.week_hi) {
+                painter.text(
+                    content.center_top() + Vec2::new(0.0, 6.0),
+                    Align2::CENTER_TOP,
+                    format!("{}   ·   Q ← 上一周   下一周 → E", w.label()),
+                    FontId::proportional(13.0),
+                    pal.text_weak,
+                );
+            }
+        }
+
         // ---- 左下角状态 ----
         painter.text(
             content.left_bottom() + Vec2::new(4.0, -2.0),
@@ -2053,6 +2309,610 @@ impl App {
             FontId::proportional(11.0),
             pal.text_weak.gamma_multiply(0.7),
         );
+    }
+}
+
+impl App {
+    // ------------------------------------------------------ 阅读地图（三维）
+
+    /// 阅读地图的侧栏控制。
+    fn reading_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("阅读地图").strong());
+        ui.add_space(4.0);
+
+        if self.reading.books.is_empty() {
+            ui.weak("还没有读过的书。");
+            ui.add_space(4.0);
+            ui.weak(format!("在 {READING_DIR_HINT} 里，每本书放一个 .md："));
+            ui.weak("frontmatter 写 author 和 country，");
+            ui.weak("可选 lat/lon 覆盖坐标、date: YYYY-Www。");
+            ui.add_space(8.0);
+        } else {
+            // 时间范围：按 reading.weeks 过滤
+            let n = self.reading.weeks.len();
+            if n > 1 {
+                let labels: Vec<String> = self.reading.weeks.iter().map(|w| w.label()).collect();
+                let max = n - 1;
+                let (l1, l2) = (labels.clone(), labels.clone());
+                let lo_text = labels[self.week_lo.min(max)].clone();
+                let hi_text = labels[self.week_hi.min(max)].clone();
+                ui.label(RichText::new("时间范围").strong());
+                ui.add(
+                    egui::Slider::new(&mut self.week_lo, 0..=max)
+                        .show_value(false)
+                        .text(lo_text)
+                        .custom_formatter(move |v, _| {
+                            l1.get(v as usize).cloned().unwrap_or_default()
+                        }),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.week_hi, 0..=max)
+                        .show_value(false)
+                        .text(hi_text)
+                        .custom_formatter(move |v, _| {
+                            l2.get(v as usize).cloned().unwrap_or_default()
+                        }),
+                );
+                if self.week_lo > self.week_hi {
+                    self.week_hi = self.week_lo;
+                }
+                ui.add_space(8.0);
+            }
+        }
+
+        ui.checkbox(&mut self.auto_spin, "自动自转（空格切换）");
+        if self.auto_spin {
+            ui.add(egui::Slider::new(&mut self.spin_speed, 0.0..=3.0).text("自转速度"));
+        }
+        ui.add_space(4.0);
+        ui.weak("拖动或方向键环绕观察 · +/− 或滚轮缩放");
+        ui.weak("空格 开/停自转 · 点光点看书 · 双击开 md · F 复位");
+    }
+
+    /// 一本书是否落在当前时间范围里。
+    fn book_passes_filter(&self, book: &Book) -> bool {
+        if self.reading.weeks.is_empty() || book.weeks.is_empty() {
+            return true;
+        }
+        let (lo, hi) = (self.week_lo as u16, self.week_hi as u16);
+        book.weeks.iter().any(|&w| w >= lo && w <= hi)
+    }
+
+    /// 越新读的书越亮。
+    fn book_recency(&self, book: &Book) -> f32 {
+        let Some(last) = book.last_week() else {
+            return 0.65;
+        };
+        if self.reading.weeks.is_empty() {
+            return 0.9;
+        }
+        let (lo, hi) = (self.week_lo as f32, self.week_hi as f32);
+        if (last as f32) > hi {
+            return 1.0;
+        }
+        if (last as f32) < lo {
+            return 0.55;
+        }
+        let span = (hi - lo).max(1.0);
+        0.65 + 0.35 * ((last as f32 - lo) / span)
+    }
+
+    fn country_color(&self, ci: usize) -> Color32 {
+        CLUSTER_LIGHT[ci % CLUSTER_LIGHT.len()]
+    }
+
+    /// 回到以东亚为中心的标准视角。自转是否开启由用户用空格键控制，这里不动它。
+    fn reset_globe_camera(&mut self) {
+        let (yaw, pitch) =
+            globe::camera_angles_for(GLOBE_HOME_LAT, GLOBE_HOME_LON, self.spin);
+        self.camera_yaw = yaw.rem_euclid(std::f32::consts::TAU);
+        self.camera_pitch = pitch;
+        self.globe_zoom = 1.0;
+    }
+
+    /// 三维地球视图。地球本体走 OpenGL 回调，漂浮的作家/作品光点用同一套
+    /// 轨道相机和透视参数投影成 2D 叠画，背面的点自行遮挡。
+    fn globe_view(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let content = self.content_rect(ui.ctx());
+        let base_r = content.size().min_elem() * 0.5 * 0.62;
+
+        // ---- 自转 / 轨道相机（拖动是在三维空间中绕球观察）----
+        let dt = ui.input(|i| i.stable_dt).clamp(1.0 / 120.0, 1.0 / 20.0);
+        if resp.dragged() {
+            // `drag_delta` 是整次拖动的累计量，逐帧累加会让旋转异常加速；
+            // pointer.delta 才是本帧位移。
+            let d = ui.input(|i| i.pointer.delta());
+            self.camera_yaw -= d.x * 0.006;
+            self.camera_pitch =
+                (self.camera_pitch - d.y * 0.006).clamp(-1.45, 1.45);
+        }
+        if self.auto_spin && !resp.dragged() {
+            self.spin += dt * 0.10 * self.spin_speed;
+        }
+        self.spin = self.spin.rem_euclid(std::f32::consts::TAU);
+        self.camera_yaw = self.camera_yaw.rem_euclid(std::f32::consts::TAU);
+
+        // ---- 轨道移动 + 缩放（方向键移动相机，F 回到正面视角）----
+        let typing = ui.ctx().wants_keyboard_input();
+        let combo = ui.input(|i| i.modifiers.command);
+        if !typing && !combo {
+            let (orbit_hold, orbit_step, zin_hold, zin_step, fast) = ui.input(|i| {
+                use egui::Key::*;
+                let axis = |n, p| (i.key_down(p) as i32 - i.key_down(n) as i32) as f32;
+                let axis_s = |n, p| (i.key_pressed(p) as i32 - i.key_pressed(n) as i32) as f32;
+                let zin_d = i.key_down(Equals) || i.key_down(Plus);
+                let zin_p = i.key_pressed(Equals) || i.key_pressed(Plus);
+                (
+                    Vec2::new(axis(ArrowLeft, ArrowRight), axis(ArrowDown, ArrowUp)),
+                    Vec2::new(
+                        axis_s(ArrowLeft, ArrowRight),
+                        axis_s(ArrowDown, ArrowUp),
+                    ),
+                    zin_d as i32 as f32 - i.key_down(Minus) as i32 as f32,
+                    zin_p as i32 as f32 - i.key_pressed(Minus) as i32 as f32,
+                    i.modifiers.shift,
+                )
+            });
+            let orbit_speed = if fast { 2.5 } else { 1.25 };
+            let orbit = orbit_hold * (orbit_speed * dt) + orbit_step * 0.10;
+            if orbit != Vec2::ZERO {
+                self.camera_yaw += orbit.x;
+                self.camera_pitch =
+                    (self.camera_pitch + orbit.y).clamp(-1.45, 1.45);
+            }
+            let rate = if fast { 2.4 } else { 1.3 };
+            let mut factor = zin_hold * rate * dt;
+            if zin_step != 0.0 {
+                factor += zin_step * 0.14;
+            }
+            if factor != 0.0 {
+                self.globe_zoom = (self.globe_zoom * factor.exp()).clamp(0.4, 6.0);
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::F)) {
+                self.reset_globe_camera();
+            }
+            // 空格：开始 / 停止自转
+            if ui.input(|i| i.key_pressed(egui::Key::Space)) {
+                self.auto_spin = !self.auto_spin;
+            }
+        }
+        // 滚轮只改变镜头缩放，球心始终留在内容画布中央。
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.1 {
+                self.globe_zoom =
+                    (self.globe_zoom * (scroll * 0.0015).exp()).clamp(0.4, 6.0);
+            }
+        }
+
+        let rot = globe::scene_rotation(self.spin, self.camera_yaw, self.camera_pitch);
+        let r_px = base_r * self.globe_zoom;
+        let center = content.center();
+        // 光点大小随缩放温和变化
+        let dot_scale = self.globe_zoom.sqrt().clamp(0.85, 2.2);
+
+        // ---- 地球本体（OpenGL 回调）----
+        let (ocean_top, ocean_bottom, land_rgb, grid_rgb, grid_mix, edge, halo) = match self.theme {
+            Theme::Dark => (
+                [0.08, 0.20, 0.46], // 海洋：深蓝（提亮，暗面也看得出蓝）
+                [0.04, 0.11, 0.28],
+                [0.17, 0.17, 0.23], // 陆地：冷蓝灰 / 月光银，轻微偏紫，融进星空世界观
+                [0.26, 0.50, 0.60],
+                0.12, // 经纬网压得很淡，城市灯光才是主角
+                0.42,
+                Color32::from_rgb(0x5A, 0x9E, 0xC4),
+            ),
+            Theme::Light => (
+                [0.20, 0.38, 0.60],
+                [0.09, 0.22, 0.42],
+                [0.74, 0.75, 0.62], // 陆地：柔和沙绿
+                [0.62, 0.84, 0.96],
+                0.34,
+                0.35,
+                Color32::from_rgb(0x7F, 0xB4, 0xE6),
+            ),
+        };
+        if let Some(g) = &self.globe {
+            let g = g.clone();
+            let frame = globe::Frame {
+                rot,
+                ndc_scale: [
+                    2.0 * r_px / content.width().max(1.0),
+                    2.0 * r_px / content.height().max(1.0),
+                ],
+                light: [-0.35, 0.42, 0.84],
+                ocean_top,
+                ocean_bottom,
+                land: land_rgb,
+                grid: grid_rgb,
+                grid_mix,
+                surface_mix: match self.theme {
+                    // 夜间用纯淡灰大陆 + 白色海岸线，白天才用真实地形底图
+                    Theme::Dark => 0.0,
+                    Theme::Light => 0.58,
+                },
+                coast: match self.theme {
+                    // 大陆边缘勾一条淡淡的亮线
+                    Theme::Dark => 0.4,
+                    Theme::Light => 0.0,
+                },
+                city: match self.theme {
+                    Theme::Dark => 1.0,
+                    Theme::Light => 0.0,
+                },
+                relief: match self.theme {
+                    // 夜间给月光陆地一点地形起伏
+                    Theme::Dark => 0.8,
+                    Theme::Light => 0.0,
+                },
+                edge_darken: edge,
+            };
+            let cb = eframe::egui_glow::CallbackFn::new(move |_info, p| {
+                if let Ok(g) = g.lock() {
+                    g.paint(p.gl(), &frame);
+                }
+            });
+            // 回调始终覆盖完整内容画布。球体大小由横纵独立的 NDC 比例决定，
+            // 即使视口被窗口边界裁剪也不会改变宽高比。
+            painter.add(egui::PaintCallback {
+                rect: content,
+                callback: Arc::new(cb),
+            });
+        } else if let Some(err) = &self.globe_error {
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                format!("地球无法绘制：{err}"),
+                FontId::proportional(14.0),
+                pal.text_weak,
+            );
+        }
+
+        // ---- 大气辉光 ----
+        let silhouette_r = r_px * globe::silhouette_scale();
+        for k in 1..=7 {
+            let t = k as f32 / 7.0;
+            let rr = silhouette_r * (1.0 + t * 0.13);
+            painter.circle_stroke(
+                center,
+                rr,
+                Stroke::new(2.2, halo.gamma_multiply((1.0 - t) * 0.10)),
+            );
+        }
+
+        // ---- 计算作家/作品的三维位置 ----
+        let time = ui.input(|i| i.time) as f32;
+        const GOLDEN: f32 = 2.399_963_2;
+        let bob = |seed: usize| 0.03 * (time * 0.7 + seed as f32 * 1.3).sin();
+
+        let mut author_pos = vec![[0f32; 3]; self.reading.authors.len()];
+        let mut book_pos = vec![[0f32; 3]; self.reading.books.len()];
+
+        for country in &self.reading.countries {
+            let u = globe::sphere_point(country.lat, country.lon);
+            let (t, b) = globe::tangent_basis(u);
+            for (k, &ai) in country.authors.iter().enumerate() {
+                let ang = k as f32 * GOLDEN;
+                let spread = (0.18 + 0.02 * k as f32).min(0.5);
+                let off = globe::add3(
+                    globe::scale3(t, ang.cos() * spread),
+                    globe::scale3(b, ang.sin() * spread),
+                );
+                let dir = globe::normalize3(globe::add3(u, off));
+                let ra = 1.30 + 0.04 * ((k % 3) as f32) + bob(ai as usize);
+                author_pos[ai as usize] = globe::scale3(dir, ra);
+            }
+        }
+        for (ai, author) in self.reading.authors.iter().enumerate() {
+            let adir = globe::normalize3(author_pos[ai]);
+            let (t2, b2) = globe::tangent_basis(adir);
+            for (j, &bi) in author.books.iter().enumerate() {
+                let ang = j as f32 * GOLDEN + ai as f32 * 0.7;
+                let off = globe::add3(
+                    globe::scale3(t2, ang.cos() * 0.13),
+                    globe::scale3(b2, ang.sin() * 0.13),
+                );
+                let bdir = globe::normalize3(globe::add3(adir, off));
+                let rb = 1.52 + 0.06 * ((j % 3) as f32) + bob(bi as usize + 7);
+                book_pos[bi as usize] = globe::scale3(bdir, rb);
+            }
+        }
+
+        // 使用和着色器相同的轨道相机与透视投影。
+        let project = |p: [f32; 3]| -> (Pos2, [f32; 3]) {
+            let rp = rot.apply(p);
+            let perspective = globe::perspective_factor(rp[2]);
+            let sp =
+                center + Vec2::new(rp[0] * r_px, -rp[1] * r_px) * perspective;
+            (sp, rp)
+        };
+
+        let book_screen: Vec<(Pos2, f32)> = book_pos
+            .iter()
+            .map(|p| {
+                let (s, view) = project(*p);
+                (s, globe::point_visibility(view))
+            })
+            .collect();
+        let author_screen: Vec<(Pos2, f32)> = author_pos
+            .iter()
+            .map(|p| {
+                let (s, view) = project(*p);
+                (s, globe::point_visibility(view))
+            })
+            .collect();
+
+        // ---- 命中测试（正面、且通过筛选的书）----
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let mut hovered: Option<u32> = None;
+        if let Some(p) = pointer {
+            if content.contains(p) {
+                let mut best = 12.0 * dot_scale;
+                for (bi, (sp, vis)) in book_screen.iter().enumerate() {
+                    if *vis < 0.25 || !self.book_passes_filter(&self.reading.books[bi]) {
+                        continue;
+                    }
+                    let d = (*sp - p).length();
+                    if d < best {
+                        best = d;
+                        hovered = Some(bi as u32);
+                    }
+                }
+            }
+        }
+        self.hovered_book = hovered;
+        if hovered.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            self.selected_book = hovered;
+        }
+        if resp.double_clicked() {
+            if let Some(bi) = hovered {
+                open_path(&self.reading.books[bi as usize].path);
+            }
+        }
+
+        // ---- 画尾巴 + 光点 ----
+        let mut labels: Vec<(Pos2, Align2, String, f32, Color32)> = Vec::new();
+        for (ci, country) in self.reading.countries.iter().enumerate() {
+            let base = self.country_color(ci);
+            let (anchor, view) = project(globe::sphere_point(country.lat, country.lon));
+            let v0 = globe::point_visibility(view);
+
+            for &ai in &country.authors {
+                let (ap, va) = author_screen[ai as usize];
+                // 尾巴：国度锚点 -> 作家
+                let tv = va.min(v0);
+                if tv > 0.02 {
+                    painter.line_segment(
+                        [anchor, ap],
+                        Stroke::new(1.2, base.gamma_multiply(0.28 * tv)),
+                    );
+                }
+                if va > 0.02 {
+                    // 一闪一闪：外发光和描边随时间脉动，核心只轻微起伏不熄灭
+                    let tw = 0.55 + 0.45 * (time * 2.3 + ai as f32 * 1.7).sin();
+                    let ar = 4.6 * dot_scale;
+                    painter.circle_filled(
+                        ap,
+                        ar + 4.5 + 2.5 * tw,
+                        base.gamma_multiply(0.18 * va * tw),
+                    );
+                    painter.circle_filled(ap, ar, base.gamma_multiply(va * (0.78 + 0.22 * tw)));
+                    painter.circle_stroke(
+                        ap,
+                        ar,
+                        Stroke::new(
+                            1.3,
+                            mix(base, pal.text_strong, 0.55).gamma_multiply((0.35 + 0.45 * tw) * va),
+                        ),
+                    );
+                    if va > 0.6 {
+                        labels.push((
+                            ap + Vec2::new(7.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            self.reading.authors[ai as usize].name.clone(),
+                            11.0,
+                            pal.text_weak.gamma_multiply(va),
+                        ));
+                    }
+                }
+
+                for &bi in &self.reading.authors[ai as usize].books {
+                    let (bp, vb) = book_screen[bi as usize];
+                    if vb <= 0.02 {
+                        continue;
+                    }
+                    let book = &self.reading.books[bi as usize];
+                    let shown = self.book_passes_filter(book);
+                    let sel = Some(bi) == self.selected_book;
+                    let hov = Some(bi) == self.hovered_book;
+
+                    // 尾巴：作家 -> 作品
+                    let tv = vb.min(va);
+                    if tv > 0.02 {
+                        painter.line_segment(
+                            [ap, bp],
+                            Stroke::new(1.0, base.gamma_multiply(0.20 * tv)),
+                        );
+                    }
+
+                    let rec = self.book_recency(book);
+                    let alpha = vb * if shown { rec } else { 0.16 };
+                    let color = if sel || hov { pal.accent } else { base };
+                    let rad = (if sel {
+                        4.8
+                    } else if hov {
+                        4.2
+                    } else {
+                        3.3
+                    }) * dot_scale;
+                    let twb = 0.6 + 0.4 * (time * 2.0 + bi as f32 * 2.3).sin();
+                    painter.circle_filled(
+                        bp,
+                        rad + 3.5 + 1.5 * twb,
+                        color.gamma_multiply(0.20 * alpha * twb),
+                    );
+                    painter.circle_filled(bp, rad, color.gamma_multiply(0.95 * alpha));
+
+                    if sel || hov {
+                        labels.push((
+                            bp + Vec2::new(0.0, -rad - 4.0),
+                            Align2::CENTER_BOTTOM,
+                            book.title.clone(),
+                            12.5,
+                            pal.text_strong,
+                        ));
+                    }
+                }
+            }
+
+            // 国度名
+            if v0 > 0.5 {
+                labels.push((
+                    anchor + Vec2::new(0.0, 3.0),
+                    Align2::CENTER_TOP,
+                    country.name.clone(),
+                    11.5,
+                    mix(base, pal.text_strong, 0.4).gamma_multiply(v0),
+                ));
+            }
+        }
+
+        for (pos, align, text, font, color) in labels {
+            painter.text(pos, align, text, FontId::proportional(font), color);
+        }
+
+        // ---- 底部提示 ----
+        if self.reading.books.is_empty() {
+            painter.text(
+                content.center_bottom() + Vec2::new(0.0, -20.0),
+                Align2::CENTER_BOTTOM,
+                format!(
+                    "阅读地图还没有数据 —— 在 {READING_DIR_HINT} 放每本书一个 md（写 author / country）"
+                ),
+                FontId::proportional(13.0),
+                pal.text_weak,
+            );
+        } else {
+            painter.text(
+                content.left_bottom() + Vec2::new(4.0, -2.0),
+                Align2::LEFT_BOTTOM,
+                format!(
+                    "{} 本书 · {} 位作家 · {} 个国度",
+                    self.reading.books.len(),
+                    self.reading.authors.len(),
+                    self.reading.countries.len()
+                ),
+                FontId::proportional(11.0),
+                pal.text_weak.gamma_multiply(0.7),
+            );
+        }
+    }
+
+    /// 选中一本书后的详情卡片。
+    fn book_detail_panel(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(bi) = self.selected_book else { return };
+        let Some(book) = self.reading.books.get(bi as usize) else {
+            self.selected_book = None;
+            return;
+        };
+        let author = &self.reading.authors[book.author as usize];
+        let country = &self.reading.countries[author.country as usize];
+        let title = book.title.clone();
+        let author_name = author.name.clone();
+        let country_name = country.name.clone();
+        let region = book.region.clone();
+        let rating = book.rating;
+        let path = book.path.clone();
+        let weeks = book
+            .weeks
+            .iter()
+            .filter_map(|&w| self.reading.weeks.get(w as usize))
+            .map(|w| w.label())
+            .collect::<Vec<_>>()
+            .join("  ");
+        let (clat, clon) = (country.lat, country.lon);
+
+        let inner = self.inner_square(ctx);
+        let w = 230.0_f32.min(inner.width() * 0.42);
+        let card = Rect::from_min_size(
+            Pos2::new(inner.right() - w, inner.top()),
+            egui::vec2(w, inner.height()),
+        );
+
+        let mut close = false;
+        let mut locate = false;
+        egui::Area::new(egui::Id::new("book-detail"))
+            .fixed_pos(card.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_max_width(card.width());
+                egui::Frame::NONE
+                    .fill(pal.card)
+                    .stroke(Stroke::new(1.0, pal.window_border))
+                    .corner_radius(16)
+                    .inner_margin(egui::Margin::symmetric(14, 12))
+                    .show(ui, |ui| {
+                        ui.set_width(card.width() - 28.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&title)
+                                    .size(17.0)
+                                    .strong()
+                                    .color(pal.text_strong),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("×").clicked() {
+                                        close = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.label(RichText::new(&author_name).color(pal.accent));
+                        ui.weak(match &region {
+                            Some(r) => format!("{country_name} · {r}"),
+                            None => country_name.clone(),
+                        });
+                        if let Some(r) = rating {
+                            let stars = "★".repeat(r.min(5) as usize)
+                                + &"☆".repeat(5usize.saturating_sub(r as usize));
+                            ui.label(RichText::new(stars).color(pal.accent));
+                        }
+                        if !weeks.is_empty() {
+                            ui.weak(weeks);
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("定位到此").clicked() {
+                                locate = true;
+                            }
+                            if ui.button("打开 md").clicked() {
+                                open_path(&path);
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.weak(format!(
+                            "{author_name} 名下共 {} 本",
+                            self.reading.authors[book.author as usize].books.len()
+                        ));
+                    });
+            });
+
+        if close {
+            self.selected_book = None;
+        }
+        if locate {
+            // 把轨道相机移动到这本书所在国度的正上方。
+            let (yaw, pitch) = globe::camera_angles_for(clat, clon, self.spin);
+            self.camera_yaw = yaw.rem_euclid(std::f32::consts::TAU);
+            self.camera_pitch = pitch.clamp(-1.45, 1.45);
+            self.auto_spin = false;
+        }
     }
 }
 
@@ -2273,6 +3133,42 @@ fn textured_fan(rect: Rect, pts: &[Pos2], tex: egui::TextureId, tint: Color32) -
 /// 换图的话替换 `assets/` 里的文件再重新编译即可。
 const BKG_BYTES: &[u8] = include_bytes!("../assets/bkg.png");
 const TAB_BKG_BYTES: &[u8] = include_bytes!("../assets/tab_bkg.png");
+/// 暗色主题的星空背景（PIL 程序化生成）。
+const NIGHT_BKG_BYTES: &[u8] = include_bytes!("../assets/night_bkg.png");
+/// 三维地球的陆海遮罩（等距圆柱，白=陆地）。由 NASA Blue Marble 阈值而来。
+const EARTH_MASK_BYTES: &[u8] = include_bytes!("../assets/earth_mask.png");
+/// Natural Earth II 地形底图（公共领域），用于区分东亚、中亚、中东等陆地区域。
+const EARTH_SURFACE_BYTES: &[u8] = include_bytes!("../assets/earth_surface.png");
+/// NASA Black Marble 城市灯光（公共领域），夜间在人口密集处点亮金色灯光。
+const EARTH_LIGHTS_BYTES: &[u8] = include_bytes!("../assets/earth_lights.png");
+
+/// 解码陆海遮罩成单通道，供地球着色器采样。解码失败就退回纯着色海球。
+fn load_earth_mask() -> Option<globe::MaskImage> {
+    let img = image::load_from_memory(EARTH_MASK_BYTES).ok()?.to_luma8();
+    Some(globe::MaskImage {
+        width: img.width() as i32,
+        height: img.height() as i32,
+        data: img.into_raw(),
+    })
+}
+
+fn load_earth_surface() -> Option<globe::SurfaceImage> {
+    let img = image::load_from_memory(EARTH_SURFACE_BYTES).ok()?.to_rgb8();
+    Some(globe::SurfaceImage {
+        width: img.width() as i32,
+        height: img.height() as i32,
+        data: img.into_raw(),
+    })
+}
+
+fn load_earth_lights() -> Option<globe::MaskImage> {
+    let img = image::load_from_memory(EARTH_LIGHTS_BYTES).ok()?.to_luma8();
+    Some(globe::MaskImage {
+        width: img.width() as i32,
+        height: img.height() as i32,
+        data: img.into_raw(),
+    })
+}
 
 fn load_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
@@ -2295,7 +3191,7 @@ fn open_path(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::remap_week_range;
+    use super::{remap_week_range, EARTH_LIGHTS_BYTES, EARTH_MASK_BYTES, EARTH_SURFACE_BYTES};
     use crate::vocab::Week;
 
     fn week(year: u16, week: u8) -> Week {
@@ -2332,6 +3228,59 @@ mod tests {
         const BYTES: &[u8] = include_bytes!("../assets/bkg.png");
         let img = image::load_from_memory(BYTES).expect("背景图解码失败").to_rgba8();
         assert_eq!((img.width(), img.height()), (1672, 941));
+    }
+
+    #[test]
+    fn earth_textures_decode_and_match_known_coordinates() {
+        let mask = image::load_from_memory(EARTH_MASK_BYTES)
+            .expect("地球陆海遮罩解码失败")
+            .to_luma8();
+        let surface = image::load_from_memory(EARTH_SURFACE_BYTES)
+            .expect("地球地形底图解码失败")
+            .to_rgb8();
+        assert_eq!(mask.dimensions(), (4096, 2048));
+        assert_eq!(surface.dimensions(), mask.dimensions());
+
+        let sample = |lat: f32, lon: f32| {
+            let x = (((lon + 180.0) / 360.0) * mask.width() as f32)
+                .floor()
+                .clamp(0.0, mask.width() as f32 - 1.0) as u32;
+            let y = (((90.0 - lat) / 180.0) * mask.height() as f32)
+                .floor()
+                .clamp(0.0, mask.height() as f32 - 1.0) as u32;
+            mask.get_pixel(x, y).0[0]
+        };
+
+        assert!(sample(35.9, 104.2) > 200, "中国坐标必须落在陆地");
+        assert!(sample(36.2, 138.3) > 200, "日本坐标必须落在陆地");
+        assert!(sample(39.0, 35.2) > 200, "土耳其坐标必须落在陆地");
+        assert!(sample(0.0, -150.0) < 40, "太平洋坐标必须落在海洋");
+    }
+
+    #[test]
+    fn city_lights_decode_and_light_up_populated_areas() {
+        let lights = image::load_from_memory(EARTH_LIGHTS_BYTES)
+            .expect("城市灯光解码失败")
+            .to_luma8();
+        let (w, h) = lights.dimensions();
+        assert_eq!(w, h * 2, "灯光图必须是 2:1 等距圆柱");
+        // 取一小块邻域的最大值，避开城市之间的缝隙
+        let bright = |lat: f32, lon: f32| {
+            let cx = (((lon + 180.0) / 360.0) * w as f32) as i32;
+            let cy = (((90.0 - lat) / 180.0) * h as f32) as i32;
+            let mut m = 0u8;
+            for dy in -12..=12 {
+                for dx in -12..=12 {
+                    let x = (cx + dx).rem_euclid(w as i32) as u32;
+                    let y = (cy + dy).clamp(0, h as i32 - 1) as u32;
+                    m = m.max(lights.get_pixel(x, y).0[0]);
+                }
+            }
+            m
+        };
+        assert!(bright(40.0, -74.0) > 150, "纽约附近应有城市灯光");
+        assert!(bright(31.0, 121.0) > 150, "上海附近应有城市灯光");
+        assert!(bright(0.0, -150.0) < 30, "太平洋应当是暗的");
     }
 }
 
