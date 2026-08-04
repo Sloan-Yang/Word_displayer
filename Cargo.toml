@@ -17,15 +17,19 @@ walkdir = "2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
-# 只为了注册 Ctrl+9 这个全局热键
+# 全局热键、窗口管理与单实例守卫
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
     "Win32_System_Threading",
     "Win32_System_SystemInformation",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+winresource = "0.1.31"
 
 [profile.release]
 opt-level = 3

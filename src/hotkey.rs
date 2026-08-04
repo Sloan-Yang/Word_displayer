@@ -388,7 +388,7 @@ mod imp {
         }
     }
 
-    fn show() {
+    pub fn show() {
         let hwnd = main_hwnd();
         if hwnd.is_null() {
             return;
@@ -473,6 +473,7 @@ mod imp {
         true
     }
     pub fn hide() {}
+    pub fn show() {}
     /// 非 Windows 平台暂时不裁窗口形状，圆角只是画出来的
     pub fn apply_window_shape(_radius_px: i32) {}
     pub fn snap_top_center() -> bool {
@@ -494,5 +495,5 @@ mod imp {
 
 pub use imp::{
     apply_window_shape, current_monitor_id, current_monitor_id_away_from, hide, is_visible,
-    local_hour, restore_size, snap_top_center, snap_top_center_on, spawn,
+    local_hour, restore_size, show, snap_top_center, snap_top_center_on, spawn,
 };

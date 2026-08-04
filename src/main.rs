@@ -6,13 +6,26 @@ mod globe;
 mod hotkey;
 mod layout;
 mod reading;
+mod single_instance;
 mod vocab;
 
 use std::path::PathBuf;
 
 const DEFAULT_ROOT: &str = r"D:\Code\Vocab";
+const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/app_icon.png");
 
-fn main() -> eframe::Result<()> {
+fn app_icon() -> egui::IconData {
+    let image = image::load_from_memory(APP_ICON_BYTES)
+        .expect("内置应用图标无法解码")
+        .to_rgba8();
+    egui::IconData {
+        width: image.width(),
+        height: image.height(),
+        rgba: image.into_raw(),
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root: PathBuf = args
         .iter()
@@ -26,6 +39,10 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let Some(instance_guard) = single_instance::acquire()? else {
+        return Ok(());
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
@@ -34,6 +51,7 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true)
+            .with_icon(app_icon())
             .with_title("LEXIS · Word Atlas"),
         // 阅读地图那颗三维地球要用深度缓冲，让正面半球盖住背面
         depth_buffer: 24,
@@ -43,8 +61,26 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "LEXIS · Word Atlas",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, root)))),
-    )
+        Box::new(move |cc| {
+            instance_guard.listen_for_activation(cc.egui_ctx.clone());
+            Ok(Box::new(app::App::new(cc, root)))
+        }),
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::app_icon;
+
+    #[test]
+    fn bundled_app_icon_is_valid_rgba() {
+        let icon = app_icon();
+        assert_eq!((icon.width, icon.height), (512, 512));
+        assert_eq!(icon.rgba.len(), 512 * 512 * 4);
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 0));
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
+    }
 }
 
 fn print_stats(root: &std::path::Path) {

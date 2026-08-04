@@ -115,6 +115,27 @@ const GLOBE_HOME_LON: f32 = 118.0;
 /// Windows 的 Win+Shift+方向键跨屏移动会经历几帧过渡态；延后并重试归位。
 const MONITOR_SWITCH_SNAP_FRAMES: u32 = 12;
 
+/// 从时间范围内的种子出发，按链接扩展显示集合。`None` 表示遍历完整连通分量。
+fn expand_linked_nodes(graph: &Graph, seeds: &[u32], max_hops: Option<usize>) -> Vec<u32> {
+    let mut seen: HashSet<u32> = seeds.iter().copied().collect();
+    let mut frontier: VecDeque<(u32, usize)> = seeds.iter().map(|&seed| (seed, 0usize)).collect();
+
+    while let Some((current, depth)) = frontier.pop_front() {
+        if max_hops.is_some_and(|max| depth >= max) {
+            continue;
+        }
+        for &neighbor in &graph.nodes[current as usize].neighbors {
+            if seen.insert(neighbor) {
+                frontier.push_back((neighbor, depth + 1));
+            }
+        }
+    }
+
+    let mut nodes: Vec<u32> = seen.into_iter().collect();
+    nodes.sort_unstable();
+    nodes
+}
+
 /// 重新读取词库后，周列表可能因为新增/删除笔记而改变下标。
 /// 按周标签重新定位旧范围，不能直接复用下标，也不能重置成最近四周。
 fn remap_week_range(
@@ -251,7 +272,8 @@ pub struct App {
     // 筛选
     week_lo: usize,
     week_hi: usize,
-    hops: usize,
+    /// 最大关联跳数；`None` 表示显示种子所在的完整连通分量。
+    hops: Option<usize>,
     hide_isolated: bool,
     focus: Option<u32>,
 
@@ -400,11 +422,11 @@ impl App {
             selected_book: None,
             hovered_book: None,
             root_input: root.to_string_lossy().to_string(),
-            // 默认只看最近一周，且显示这一周的所有词（含没有链接的），
-            // 配合 Q/E 一周一周地复习
+            // 时间种子默认只取最近一周，再无限展开这些种子所在的连通分量，
+            // 既保留本周孤立词，也带出链路深处的早期词，配合 Q/E 按周复习。
             week_lo: last,
             week_hi: last,
-            hops: 1,
+            hops: None,
             hide_isolated: false,
             focus: None,
             graph,
@@ -502,22 +524,8 @@ impl App {
             }
         }
 
-        // 按跳数扩散，把有联系的词一起带出来
-        let mut seen: HashSet<u32> = seeds.iter().copied().collect();
-        let mut frontier: VecDeque<(u32, usize)> = seeds.iter().map(|&s| (s, 0usize)).collect();
-        while let Some((cur, d)) = frontier.pop_front() {
-            if d >= self.hops {
-                continue;
-            }
-            for &nb in &g.nodes[cur as usize].neighbors {
-                if seen.insert(nb) {
-                    frontier.push_back((nb, d + 1));
-                }
-            }
-        }
-
-        let mut ids: Vec<u32> = seen.into_iter().collect();
-        ids.sort_unstable();
+        // 默认遍历种子所在的完整连通分量，把链路深处的早期单词也带出来。
+        let mut ids = expand_linked_nodes(g, &seeds, self.hops);
 
         // 标签筛选：黑名单里的标签一律不显示；一旦有白名单，只留命中白名单的
         let (only, hidden) = self.tag_index_sets();
@@ -1409,9 +1417,27 @@ impl App {
 
     fn scope_controls(&mut self, ui: &mut egui::Ui) {
         let mut structural = false;
-        structural |= ui
-            .add(egui::Slider::new(&mut self.hops, 0..=3).text("展开层数"))
-            .changed();
+        ui.horizontal(|ui| {
+            ui.label("关联展开");
+            let selected = self
+                .hops
+                .map(|hops| format!("{hops} 跳"))
+                .unwrap_or_else(|| "无限".to_string());
+            egui::ComboBox::from_id_salt("linked-node-hop-limit")
+                .selected_text(selected)
+                .width(88.0)
+                .show_ui(ui, |ui| {
+                    for (limit, label) in [
+                        (Some(0), "0 跳"),
+                        (Some(1), "1 跳"),
+                        (Some(2), "2 跳"),
+                        (Some(3), "3 跳"),
+                        (None, "无限"),
+                    ] {
+                        structural |= ui.selectable_value(&mut self.hops, limit, label).changed();
+                    }
+                });
+        });
 
         // 界面上说「显示」，内部存的是「隐藏」，这里翻一下
         let mut show_isolated = !self.hide_isolated;
@@ -3139,11 +3165,41 @@ fn open_path(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{remap_week_range, EARTH_LIGHTS_BYTES, EARTH_MASK_BYTES, EARTH_SURFACE_BYTES};
-    use crate::vocab::Week;
+    use super::{
+        expand_linked_nodes, remap_week_range, EARTH_LIGHTS_BYTES, EARTH_MASK_BYTES,
+        EARTH_SURFACE_BYTES,
+    };
+    use crate::vocab::{Graph, Node, Week};
+    use std::path::PathBuf;
 
     fn week(year: u16, week: u8) -> Week {
         Week { year, week }
+    }
+
+    fn node(name: &str, neighbors: &[u32]) -> Node {
+        Node {
+            name: name.into(),
+            path: PathBuf::new(),
+            weeks: Vec::new(),
+            tags: Vec::new(),
+            neighbors: neighbors.to_vec(),
+            component: 0,
+        }
+    }
+
+    #[test]
+    fn unlimited_expansion_includes_transitive_older_nodes() {
+        let mut graph = Graph::default();
+        graph.nodes = vec![
+            node("this-week", &[1]),
+            node("linked", &[0, 2]),
+            node("older", &[1, 3]),
+            node("oldest", &[2]),
+            node("unrelated", &[]),
+        ];
+
+        assert_eq!(expand_linked_nodes(&graph, &[0], Some(2)), vec![0, 1, 2]);
+        assert_eq!(expand_linked_nodes(&graph, &[0], None), vec![0, 1, 2, 3]);
     }
 
     #[test]
